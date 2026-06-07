@@ -1,0 +1,53 @@
+# 冒烟测试 recipe：少量 PDF + 无 LLM 前半段。
+# 验证 MinerU 真实解析 + DIR + 证据归一化 + 结构图 + 表格行列解析 + 子图采样。
+# 运行：python -m autoqag.pipeline --recipe recipes/smoke.yaml --to sample
+
+work_dir: outputs/smoke
+
+global_params:
+  domain: metamaterials
+  llm:
+    model: deepseek-chat
+    max_concurrency: 4
+
+pipeline:
+  - stage: ingest
+    params:
+      input_dir: data/smoke
+      recursive: false
+
+  - stage: parse
+    params:
+      backend: pipeline
+      method: auto
+      device: cpu
+      fallback: pymupdf
+      fallback_on_low: true
+
+  - stage: normalize
+    params:
+      normalize_units: true
+
+  # 开启 LLM 点抽取 + 结构图 + 表格行列解析
+  - stage: graph
+    params:
+      extract_points: true
+      max_text_blocks: 30      # 冒烟限制文本块数，控制 token 与时间
+      parse_table_cells: true
+      cross_paper: true
+
+  - stage: sample
+    params:
+      per_type: 15
+
+  - stage: generate
+    params:
+      max_plans: 40            # 冒烟限制 plan 数，控制时间
+  - stage: corrupt
+    params: {per_qa: 2}
+  - stage: verify
+    params: {}
+  - stage: repair
+    params: {max_rounds: 2}
+  - stage: output
+    params: {}

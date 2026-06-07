@@ -1,0 +1,18 @@
+# Core
+openai>=1.30.0          # OpenAI-compatible async client (LLM extract/generate/verify)
+tenacity>=8.2.0         # LLM retry
+tiktoken>=0.6.0         # token counting / rate-limit estimation
+pyyaml>=6.0             # recipe.yaml parsing
+pydantic>=2.0           # config/data validation
+networkx>=3.0           # Schema-Evidence Graph storage
+pint>=0.23              # unit normalization & conversion (m3 / m8)
+loguru>=0.7.0           # logging (falls back to stdlib logging if missing)
+
+# Parsing
+pymupdf>=1.24.0         # PDF parsing fallback (when MinerU unavailable)
+# mineru[core]          # main parser, install separately: pip install -U "mineru[core]"
+#                       # pipeline backend runs on CPU; VLM backend needs GPU
+
+# Optional: graph visualization / experiment analysis
+# matplotlib
+# scikit-learn

@@ -1,0 +1,85 @@
+# AutoQAGBenchmark MVP recipe (论文 §5.9)。
+# 驱动完整 8 模块端到端闭环：
+#   ingest → parse → normalize → graph → sample → generate → corrupt → verify → repair → output
+# 运行：python -m autoqag.pipeline --recipe recipes/mvp.yaml
+# 单跑某 stage：python -m autoqag.pipeline --recipe recipes/mvp.yaml --only graph
+
+work_dir: outputs/mvp
+
+global_params:
+  # 领域：aerospace / materials (论文 §5.1 MVP 两个领域)
+  domain: materials
+  # LLM 配置：留空则从环境变量读取 (AUTOQAG_* 或 OPENAI_*)
+  # base_url 可指向 DeepSeek / Qwen / 本地 vLLM 等 OpenAI 兼容端点
+  llm:
+    model: gpt-4o-mini
+    # api_key: 建议放环境变量 AUTOQAG_API_KEY，勿写明文
+    # base_url: https://api.deepseek.com/v1
+    temperature: 0.0
+    max_concurrency: 8
+    rpm: 1000
+    tpm: 50000
+
+pipeline:
+  # 模块一：PDF 输入与数据管理
+  - stage: ingest
+    params:
+      input_dir: data/raw
+      recursive: true
+
+  # 模块二：MinerU 解析 + DIR + 解析质量门控 (低质回退 PyMuPDF)
+  - stage: parse
+    params:
+      backend: pipeline      # pipeline(纯CPU) | vlm-* (需GPU)
+      method: auto
+      device: cpu
+      fallback: pymupdf
+      fallback_on_low: true
+
+  # 模块三：证据归一化 (6 类 EvidenceBlock + 地址 + 单位归一)
+  - stage: normalize
+    params:
+      normalize_units: true
+
+  # 模块四：Schema-Evidence Graph (点抽取 + 共现/结构/跨模态/跨文献边)
+  - stage: graph
+    params:
+      extract_points: true   # false 则只建结构图，便于无 LLM 调试
+      lang: en               # 抽取 prompt 语言 en/zh
+      cross_paper: true
+      # max_text_blocks: 50  # 调试时限制文本块数量以省 token
+
+  # 模块四(下)：子图采样 + Question Plan (8 题型, L1-L4)
+  - stage: sample
+    params:
+      per_type: 30
+      types: [atomic, numerical, condition, comparative, table, formula, multi_hop, summary]
+
+  # 模块五：QA + 高级训练语料生成
+  - stage: generate
+    params: {}
+      # max_plans: 100       # 调试时限制 plan 数量
+
+  # 模块六：负样本与错误扰动 (10 类) + verifier/preference 样本
+  - stage: corrupt
+    params:
+      per_qa: 2
+      seed: 42
+
+  # 模块七：四层约束验证 (MVP 数值/单位/条件/证据, 语义层可选)
+  - stage: verify
+    params:
+      numerical_check: true
+      unit_check: true
+      condition_check: true
+      evidence_check: true
+      semantic_check: false  # true 需额外 LLM 调用
+
+  # 模块八：violation 驱动自修复 (≤3 轮)
+  - stage: repair
+    params:
+      max_rounds: 3
+
+  # 模块九：数据输出与组织 (benchmark + corpus + 图谱 + manifest)
+  - stage: output
+    params: {}

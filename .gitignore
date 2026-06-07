@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+
+# 运行产物 (大文件，不入库)
+outputs/
+*.graphml
+
+# 输入 PDF (版权 + 体积大，不入库)
+data/raw/*.pdf
+data/smoke/*.pdf
+data/**/mineru/
+
+# MinerU 缓存与模型
+mineru/
+*.log
+
+# 环境与密钥
+.env
+*.key
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
