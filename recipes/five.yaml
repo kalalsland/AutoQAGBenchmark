@@ -1,0 +1,60 @@
+# 5 篇同领域文献完整测试 recipe：
+#   - 多模态：Figure/Table/Equation 节点 + references / describes / aligns_with 边
+#   - 跨文献：same_as 聚合 (5 篇频率选择吸波体/Rasorber 同域论文)
+#   - 多样性：8 题型全开 + 按题型轮转截断，重点验证 multi_hop / comparative / summary
+#   - 闭环：corrupt → verify(含 LLM 语义层) → repair 循环迭代
+# 运行：python -m autoqag.pipeline --recipe recipes/five.yaml
+
+work_dir: outputs/five
+
+global_params:
+  domain: metamaterials
+  llm:
+    model: deepseek-chat
+    max_concurrency: 8
+
+pipeline:
+  - stage: ingest
+    params:
+      input_dir: data/five
+      recursive: false
+
+  - stage: parse
+    params:
+      backend: pipeline
+      method: auto
+      device: cpu
+      fallback: pymupdf
+      fallback_on_low: true
+
+  - stage: normalize
+    params:
+      normalize_units: true
+
+  - stage: graph
+    params:
+      extract_points: true
+      max_text_blocks: 120     # 5 篇约 24 文本块/篇；图注块不计限额全保留
+      parse_table_cells: true
+      cross_paper: true
+
+  - stage: sample
+    params:
+      per_type: 12             # 8 题型 × 12 = 最多 96 plan
+
+  - stage: generate
+    params:
+      max_plans: 96            # 按题型轮转截断，保持多样性
+
+  - stage: corrupt
+    params: {per_qa: 2}
+
+  - stage: verify
+    params:
+      semantic_check: true     # 开启 LLM 语义层，测试完整四层自动评测
+
+  - stage: repair
+    params: {max_rounds: 3}    # 测试 violation 驱动循环迭代修复
+
+  - stage: output
+    params: {}

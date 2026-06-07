@@ -16,7 +16,7 @@ from typing import Any, Dict, List
 from autoqag.common.io import read_jsonl_list, write_jsonl
 from autoqag.ops.base import BaseStage, PipelineContext
 from autoqag.ops.m6_generate.json_utils import parse_json
-from autoqag.ops.m8_verify.verifiers import CHECKERS, _evidence_text
+from autoqag.ops.m8_verify.verifiers import CHECKERS, _evidence_text, is_refusal
 from autoqag.registry import STAGES
 from autoqag.schema import QAItem
 from autoqag.templates.verify_repair import REPAIR_PROMPT
@@ -90,8 +90,10 @@ class RepairStage(BaseStage):
                 qa.answer = new_answer
                 evidence = _evidence_text(qa)
                 new_viol = []
-                for name in enabled:
-                    new_viol.extend(CHECKERS[name](qa, evidence))
+                if not is_refusal(new_answer):
+                    # 修复为合法拒答视为通过 (证据确实不足)；否则重跑约束层
+                    for name in enabled:
+                        new_viol.extend(CHECKERS[name](qa, evidence))
                 qa.validator_result = {
                     "passed": len(new_viol) == 0,
                     "n_violations": len(new_viol),

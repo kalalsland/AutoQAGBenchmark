@@ -217,19 +217,24 @@ def _find_formula(v: _GraphView, k: int) -> List[Dict[str, Any]]:
 
 
 def _find_multihop(v: _GraphView, k: int) -> List[Dict[str, Any]]:
-    """跨 chunk/section 的多跳路径 (多跳综合题)：从 Concept 出发 BFS 3-4 跳。"""
-    out = []
-    concepts = v.of_type(NodeType.CONCEPT.value)
+    """跨 chunk/section 的多跳路径 (多跳综合题)：从 Concept 出发 BFS。
+
+    要求路径真正体现图谱必要性：(1) 只走语义节点 (跳过匿名表格值单元格，
+    否则产出'某参数值是多少→8'这类模糊题)；(2) 优先跨 section 的路径；
+    (3) 至少 3 个不同语义节点。
+    """
+    cross, intra = [], []
+    concepts = [c for c in v.of_type(NodeType.CONCEPT.value) if _node_ok(v, c)]
     for start in concepts:
         path = _bfs_path(v, start, max_len=4)
-        if len(path) >= 3:
-            sections = {v.nodes[n].get("address", {}).get("section_path", "") for n in path}
-            # 优先保留跨 section 的路径以体现难度
-            edges = list(zip(path, path[1:]))
-            out.append({"nodes": path, "edges": edges, "path_length": len(path) - 1})
-            if len(out) >= k:
-                return out
-    return out
+        if len(path) < 3:
+            continue
+        sections = {v.nodes[n].get("address", {}).get("section_path", "") for n in path}
+        edges = list(zip(path, path[1:]))
+        sg = {"nodes": path, "edges": edges, "path_length": len(path) - 1}
+        (cross if len(sections) >= 2 else intra).append(sg)
+    # 跨 section 的多跳更能体现图谱定位+关联的必要性，优先
+    return (cross + intra)[:k]
 
 
 def _find_summary(v: _GraphView, k: int) -> List[Dict[str, Any]]:
@@ -254,7 +259,20 @@ def _find_summary(v: _GraphView, k: int) -> List[Dict[str, Any]]:
 
 
 def _bfs_path(v: _GraphView, start: str, max_len: int = 4) -> List[str]:
-    """从 start 出发取一条尽量长的简单路径 (优先跨 section)。"""
+    """从 start 出发取一条尽量长的简单路径，只经语义节点。
+
+    跳过匿名表格值单元格 (node_id 形如 ::rNcM，无语义标签) 与未通过质量门的点，
+    确保多跳问题落在'概念→属性→方法→结论'这类有意义的链上。
+    """
+    def passable(nid: str) -> bool:
+        if "::r" in nid and "c" in nid.rsplit("::", 1)[-1]:
+            return False  # 表格数据单元格，匿名无标签
+        d = v.nodes.get(nid, {})
+        if d.get("node_type") == NodeType.VALUE.value:
+            # 数值节点本身无独立语义，仅当带内容上下文时保留
+            return len((d.get("content") or "").strip()) > 6
+        return _node_ok(v, nid)
+
     path = [start]
     visited = {start}
     cur = start
@@ -262,7 +280,7 @@ def _bfs_path(v: _GraphView, start: str, max_len: int = 4) -> List[str]:
         cands = [t for t, _ in v.out.get(cur, [])] + [s for s, _ in v.inc.get(cur, [])]
         nxt = None
         for c in cands:
-            if c not in visited:
+            if c not in visited and passable(c):
                 nxt = c
                 break
         if nxt is None:

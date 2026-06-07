@@ -12,7 +12,7 @@ from typing import Any, Dict, List
 from autoqag.common.io import read_jsonl_list, write_jsonl
 from autoqag.ops.base import BaseStage, PipelineContext
 from autoqag.ops.m6_generate.json_utils import parse_json
-from autoqag.ops.m8_verify.verifiers import CHECKERS, _evidence_text
+from autoqag.ops.m8_verify.verifiers import CHECKERS, _evidence_text, is_refusal
 from autoqag.registry import STAGES
 from autoqag.schema import QAItem, Violation, VerifyLayer
 from autoqag.templates.verify_repair import SEMANTIC_VERIFY_PROMPT
@@ -58,6 +58,18 @@ class VerifyStage(BaseStage):
             semantic_results = [parse_json(r) or {} for r in resp]
 
         for i, qa in enumerate(qa_items):
+            # 合法拒答 (证据不足) 直接通过：约束层不适用，避免误入 human_review
+            if is_refusal(qa.answer):
+                qa.validator_result = {
+                    "passed": True,
+                    "n_violations": 0,
+                    "layers_checked": enabled,
+                    "violations": [],
+                    "refusal": True,
+                }
+                passed += 1
+                continue
+
             evidence = _evidence_text(qa)
             violations: List[Violation] = []
             for name in enabled:

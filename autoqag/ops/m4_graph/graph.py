@@ -482,7 +482,11 @@ class GraphStage(BaseStage):
             return 0
         max_blocks = self.params.get("max_text_blocks")
         if max_blocks:
-            target_blocks = target_blocks[: int(max_blocks)]
+            # 限额只作用于正文文本块；图注块短且是跨模态对齐 (§十.3) 的必要输入，
+            # 全部保留 (此前图注被截掉导致 aligns_with 恒为 0)
+            text_blocks = [b for b in target_blocks if b.modality == Modality.TEXT.value]
+            caption_blocks = [b for b in target_blocks if b.modality == Modality.CAPTION.value]
+            target_blocks = text_blocks[: int(max_blocks)] + caption_blocks
 
         prompts = [
             build_prompt(b.content, b.modality, b.address.section_path, lang)

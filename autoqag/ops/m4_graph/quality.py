@@ -21,7 +21,13 @@ STOPWORD_NAMES = {
     "symbol", "symbols", "quantity", "unit", "units", "name", "type",
     "data", "result", "results", "table", "fig", "figure", "ref", "refs",
     "n/a", "na", "none", "-", "/", "—",
+    # 对比表里的自指/泛指行标签，作跨文献概念时只会连出噪声
+    "this work", "proposed", "proposed work", "ours", "this paper",
+    "ref.", "reference", "others",
 }
+
+# 引用标记 ([20] / [16,17] / [3]-[5])，常被误抽为概念
+_CITATION_RE = re.compile(r"^\[\s*\d+\s*(?:[,\-–]\s*\d+\s*)*\]$")
 
 # 元数据 / 版权噪声 (出现即判为非科研约束)
 _METADATA_RE = re.compile(
@@ -46,11 +52,13 @@ def _norm(s: str) -> str:
 
 
 def is_symbolic_name(s: str) -> bool:
-    """单字符 / 纯标点 / 布尔(Y/N) / 纯 LaTeX 符号 → 视为符号噪声。"""
+    """单字符 / 纯标点 / 布尔(Y/N) / 纯 LaTeX 符号 / 引用标记 → 视为符号噪声。"""
     s = _norm(s)
     if not s:
         return True
     if s.upper() in {"Y", "N", "YES", "NO", "/", "-", "—", "N/A"}:
+        return True
+    if _CITATION_RE.match(s):                            # [20] / [16,17] 引用标记
         return True
     if not re.search(r"[A-Za-z0-9一-鿿]", s):
         return True
@@ -99,10 +107,11 @@ def is_valid_point(node_type: str, name: str, content: str) -> bool:
     if node_type in structural:
         return True
 
-    # 元数据混入：任何语义点出现版权/卷期/日期等 → 丢弃 (含 AttributeNode 的 "Volume 25")
+    # 元数据混入：任何语义点的名称或内容出现版权/卷期/收稿日期等 → 丢弃
+    # (LLM 常把 "Received: 7 January 2026, Revised…" 抽成 ConditionNode，需查 content)
     if node_type in (
         "ConditionNode", "ClaimNode", "MethodNode", "ConceptNode", "AttributeNode"
-    ) and is_metadata(name):
+    ) and (is_metadata(name) or is_metadata(content)):
         return False
 
     # Value/Unit 走专门校验
@@ -116,6 +125,10 @@ def is_valid_point(node_type: str, name: str, content: str) -> bool:
         if is_symbolic_name(name):
             return False
         if is_stopword_name(name):
+            return False
+        # 必须含一个长度>=2 的字母词 (英文或中文)，否则是表格数字碎片：
+        # "5.02,2.22" / "(34.75%) 3.898" / "N.A." / "0.64~" / 纯数字列头 "0"
+        if not re.search(r"[A-Za-z]{2,}|[一-鿿]{2,}", name):
             return False
     # Concept 不应是纯测量值 (LLM 常把 "0.8 mm" 误标为概念)
     if node_type == "ConceptNode" and _looks_like_measurement(name):

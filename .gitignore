@@ -15,6 +15,7 @@ outputs/
 # 输入 PDF (版权 + 体积大，不入库)
 data/raw/*.pdf
 data/smoke/*.pdf
+data/five/*.pdf
 data/**/mineru/
 
 # MinerU 缓存与模型

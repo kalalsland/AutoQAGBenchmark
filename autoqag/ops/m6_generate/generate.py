@@ -38,8 +38,10 @@ class GenerateStage(BaseStage):
 
         plans = [QuestionPlan.from_dict(r) for r in rows]
         max_plans = self.params.get("max_plans")
-        if max_plans:
-            plans = plans[: int(max_plans)]
+        if max_plans and len(plans) > int(max_plans):
+            # 按题型轮转截断：plans 按题型分段排列，直接 [:N] 会把排在后面的
+            # multi_hop/summary 全部截掉，破坏 benchmark 多样性
+            plans = _interleave_by_type(plans, int(max_plans))
 
         prompts = [self._build_prompt(p) for p in plans]
         self.log("LLM 生成 QA: %d 个 plan", len(prompts))
@@ -191,3 +193,21 @@ def _format_evidence(spans: List[Dict[str, Any]]) -> str:
         loc = f"{addr.get('paper_id','')}/{addr.get('section_path','')}/{addr.get('chunk_id','')}"
         lines.append(f"[{e.get('node_id','')}] ({loc}) {e.get('content','')}")
     return "\n".join(lines)
+
+
+def _interleave_by_type(plans: List[QuestionPlan], limit: int) -> List[QuestionPlan]:
+    """按题型轮转抽取前 limit 个 plan，截断后各题型尽量均衡。"""
+    buckets: Dict[str, List[QuestionPlan]] = {}
+    for p in plans:
+        buckets.setdefault(p.question_type, []).append(p)
+    out: List[QuestionPlan] = []
+    queues = list(buckets.values())
+    while len(out) < limit and queues:
+        queues = [q for q in queues if q]
+        if not queues:
+            break
+        for q in queues:
+            if len(out) >= limit:
+                break
+            out.append(q.pop(0))
+    return out

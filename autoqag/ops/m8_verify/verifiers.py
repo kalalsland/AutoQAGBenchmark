@@ -14,6 +14,17 @@ from autoqag.schema import QAItem, Violation, VerifyLayer
 
 _NUM_RE = re.compile(r"[-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?")
 
+# 合法拒答 (证据不足) 不应被任何约束层判违规
+_REFUSAL_ANSWERS = {
+    "文中无法确定", "无法确定", "无法从文中确定",
+    "cannot be determined from the text", "cannot be determined",
+}
+
+
+def is_refusal(answer: str) -> bool:
+    a = (answer or "").strip().lower().rstrip("。.")
+    return any(a == r.lower().rstrip("。.") for r in _REFUSAL_ANSWERS)
+
 
 def _evidence_text(qa: QAItem) -> str:
     return " ".join(e.get("content", "") for e in qa.evidence_spans)
