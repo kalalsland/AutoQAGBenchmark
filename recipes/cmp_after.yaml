@@ -1,0 +1,22 @@
+# 对照组「利用子图后」：semantic_plan (问题级语义覆盖层 + 评分引导规划 + 语义绑定改进)。
+#   复用 outputs/five 已有 nodes/edges 图谱，只跑 semantic_plan → generate。
+work_dir: outputs/cmp_after
+
+global_params:
+  domain: metamaterials
+  llm:
+    model: qwen-plus
+    max_concurrency: 6
+
+pipeline:
+  - stage: semantic_plan
+    params:
+      per_type: 12
+  - stage: generate
+    params:
+      max_plans: 60
+  - stage: verify
+    params:
+      semantic_check: true
+  - stage: repair
+    params: {max_rounds: 2}

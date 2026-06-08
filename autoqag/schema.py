@@ -60,6 +60,42 @@ class QuestionType(str, Enum):
     SUMMARY = "summary"
 
 
+class VirtualEdgeType(str, Enum):
+    """问题级虚拟逻辑边类型 (语义层子图构建.pdf §3.3.2 八类虚拟边)。
+
+    虚拟边只服务于问题规划 (语义覆盖层 Ωq)，不是物理证据边、不是永久边：
+    它只在当前问题中有效、连接的仍是 G0 中的原始节点、最终答案仍需回到物理证据验证。
+    """
+
+    # 同义/共指：连接同一事物的不同表达 (PCE / power conversion efficiency / 图注 efficiency)
+    ALIAS = "virtual_alias"
+    COREFERENCE = "virtual_coreference"
+    # 可比较：共享同一指标、单位与可对齐条件的两个对象 (比较题/排序题)
+    COMPARABLE = "virtual_comparable"
+    COMPARE_ON = "virtual_compare_on"
+    # 条件转移：同一对象在不同温度/时间/压力/浓度/仿真条件下的结果变化 (条件边界题/趋势题)
+    CONDITION_SHIFT = "virtual_condition_shift"
+    LIMITED_BY = "virtual_limited_by"
+    # 方法—结果 / 机制解释 (机制解释题)
+    METHOD_EFFECT = "virtual_method_effect"
+    EXPLAIN_EFFECT = "virtual_explain_effect"
+    SEEK_MECHANISM = "virtual_seek_mechanism"
+    MECHANISM = "virtual_mechanism"
+    EXPLAINS = "virtual_explains"
+    # 跨文献对齐/比较 (跨文献综合题)
+    CROSS_PAPER_ALIGN = "virtual_cross_paper_align"
+    CROSS_PAPER_COMPARE = "virtual_cross_paper_compare"
+    # 冲突与对比 (批判性/创新性问题)
+    CONTRAST = "virtual_contrast"
+    CONFLICT = "virtual_conflict"
+    # 操作链 (流程推理/操作差异)
+    OPERATION_FLOW = "virtual_operation_flow"
+    # 跨模态需求 (正文结论需图表证据)
+    NEED_VISUAL_EVIDENCE = "virtual_need_visual_evidence"
+    # 搜索可比对象 (比较题缺对象时的规划意图)
+    SEARCH_COMPARABLE = "virtual_search_comparable"
+
+
 class Difficulty(str, Enum):
     L1 = "L1"
     L2 = "L2"
@@ -237,7 +273,67 @@ class Edge:
 
 
 # ---------------------------------------------------------------------------
-# Question Plan (论文创新三 §4)
+# 问题级语义覆盖层 (语义规划层方法论.pdf + 语义层子图构建.pdf)
+# ---------------------------------------------------------------------------
+@dataclass
+class VirtualEdge:
+    """语义覆盖层 Ωq 中的一条临时虚拟逻辑边 (语义层子图构建.pdf §3.3.1)。
+
+    source/target 仍为 G0 中的原始 node_id；虚拟边只用于规划问题语义路径，
+    最终答案须由 backing_evidence_paths (物理证据路径) 支撑，否则该边被拒绝。
+    """
+
+    source: str
+    target: str
+    virtual_type: str  # VirtualEdgeType 值
+    question_role: str = ""  # 该边在题型 role schema 中承担的逻辑角色
+    score: float = 0.0  # 问题级打分 Score_q(e)
+    reason: str = ""
+    backing_evidence_paths: List[List[str]] = field(default_factory=list)
+    required_physical_nodes: List[str] = field(default_factory=list)
+    status: str = "candidate"  # candidate / accepted / rejected
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+    @staticmethod
+    def from_dict(d: Dict[str, Any]) -> "VirtualEdge":
+        return VirtualEdge(
+            **{k: v for k, v in d.items() if k in VirtualEdge.__annotations__}
+        )
+
+
+@dataclass
+class QuestionGoal:
+    """问题逻辑规划目标 (语义层子图构建.pdf §3.1.1 QuestionGoal)。
+
+    驱动初始节点初始化：先确定题型需要哪些逻辑角色，再从 G0 为这些角色找候选节点。
+    """
+
+    question_type: str = QuestionType.ATOMIC.value
+    difficulty_level: str = Difficulty.L1.value
+    domain: str = ""
+    seed_topic: str = ""
+    theme: str = ""
+    expected_answer_form: str = ""
+    expected_reasoning_pattern: str = ""
+    required_reasoning_roles: List[str] = field(default_factory=list)
+    required_constraints: List[str] = field(default_factory=list)
+    required_evidence_granularity: str = ""
+    forbidden_generalization: List[str] = field(default_factory=list)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+    @staticmethod
+    def from_dict(d: Dict[str, Any]) -> "QuestionGoal":
+        return QuestionGoal(
+            **{k: v for k, v in d.items() if k in QuestionGoal.__annotations__}
+        )
+
+
+# ---------------------------------------------------------------------------
+# Question Plan (论文创新三 §4 + 语义层子图构建.pdf §3.5)
 # ---------------------------------------------------------------------------
 @dataclass
 class QuestionPlan:
@@ -262,6 +358,24 @@ class QuestionPlan:
     forbidden_generalization: List[str] = field(default_factory=list)
     generation_instruction: str = ""
     paper_id_list: List[str] = field(default_factory=list)
+
+    # --- 问题级语义覆盖层字段 (语义规划层方法论.pdf §3.7 / 语义层子图构建.pdf §3.5) ---
+    seed_nodes: List[str] = field(default_factory=list)
+    theme: str = ""
+    # 语义覆盖层 Ωq：当前问题专属的虚拟逻辑边 (规划用，非证据)
+    semantic_overlay_edges: List[Dict[str, Any]] = field(default_factory=list)
+    # 角色完整性：role -> node_id (题型 role schema 的槽位填充情况)
+    role_assignment: Dict[str, str] = field(default_factory=dict)
+    required_roles: List[str] = field(default_factory=list)
+    # 必需的物理证据路径 (每条为 node_id 列表)，最终答案须落回这些路径
+    required_evidence_paths: List[List[str]] = field(default_factory=list)
+    # 禁止 shortcut：高难度题须显式要求跨证据整合
+    forbidden_shortcuts: List[str] = field(default_factory=list)
+    # 综合子图评分 (Subgraph Utility Score) 及其分项，便于诊断与反馈
+    utility_score: float = 0.0
+    score_breakdown: Dict[str, float] = field(default_factory=dict)
+    # 该 plan 由哪条规划路径产出 (用于长期记忆 overlay pattern)
+    overlay_pattern: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

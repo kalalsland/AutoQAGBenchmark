@@ -15,6 +15,7 @@ _STAGE_MODULES = [
     "autoqag.ops.m3_normalize.normalize",
     "autoqag.ops.m4_graph.graph",
     "autoqag.ops.m5_sample.sample",
+    "autoqag.ops.m5_sample.semantic_plan",  # 语义规划层 (评分引导子图规划 + 虚拟逻辑补全)
     "autoqag.ops.m6_generate.generate",
     "autoqag.ops.m7_corrupt.corrupt",
     "autoqag.ops.m8_verify.verify",

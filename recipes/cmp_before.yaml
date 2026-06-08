@@ -1,0 +1,22 @@
+# 对照组「利用子图前」：基线 sample (纯图遍历采样，无问题级语义覆盖层)。
+#   复用 outputs/five 已有 nodes/edges 图谱，只跑 sample → generate。
+work_dir: outputs/cmp_before
+
+global_params:
+  domain: metamaterials
+  llm:
+    model: qwen-plus
+    max_concurrency: 6
+
+pipeline:
+  - stage: sample
+    params:
+      per_type: 12
+  - stage: generate
+    params:
+      max_plans: 60
+  - stage: verify
+    params:
+      semantic_check: true
+  - stage: repair
+    params: {max_rounds: 2}
