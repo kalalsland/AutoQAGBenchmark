@@ -16,6 +16,9 @@ outputs/
 autoqag/experiments/runs/
 autoqag/experiments/results/
 
+# 绘图提示词 (内部草稿，不入库；保留生成的图片 image/*.png)
+image/*_prompt.md
+
 # 输入 PDF (版权 + 体积大，不入库)
 data/raw/*.pdf
 data/smoke/*.pdf
