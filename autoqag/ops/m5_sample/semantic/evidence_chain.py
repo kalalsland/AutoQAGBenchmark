@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Set
 
+from autoqag.ops.m4_graph.quality import is_evidence_eligible
 from autoqag.schema import NodeType
 
 # 向下游走时优先经过的边 (从抽象到具体)
@@ -232,9 +233,24 @@ def _content(view, nid: str) -> str:
     return d.get("normalized_content") or d.get("content") or ""
 
 
+def _edge_ok(d: Dict[str, Any]) -> bool:
+    """边能否作正向答案证据：极性为正且置信度达标 (图谱构建.pdf 刀1)。
+
+    被原文否定/对比/假设的共现边 (LLM 断言但极性非正) 即便仍在图中，
+    也不能用于构造正向事实 (属性/数值/单位)。旧图无 polarity/confidence 字段时
+    默认 positive/1.0，向后兼容。
+    """
+    return is_evidence_eligible(
+        d.get("confidence", 1.0), d.get("polarity", "positive")
+    )
+
+
 def attributes_of(view, obj: str) -> List[str]:
-    """obj --has_attribute--> Attribute 的属性节点列表。"""
-    return [t for t, d in view.out.get(obj, []) if d.get("edge_type") == "has_attribute"]
+    """obj --has_attribute--> Attribute 的属性节点列表 (仅取可作证据的正向边)。"""
+    return [
+        t for t, d in view.out.get(obj, [])
+        if d.get("edge_type") == "has_attribute" and _edge_ok(d)
+    ]
 
 
 def values_via_attribute(
@@ -244,17 +260,18 @@ def values_via_attribute(
 
     若给定 attr，则只经与 attr 同一节点或内容 token 重叠的属性 (保证取到的是
     "该对象在该共享指标上的值"，而非全局任意数值)，从而让 value 真正绑定 object。
+    两跳均要求边可作证据 (正向 + 置信度达标)，避免被否定的 "B does not reach X" 入题。
     """
     attr_tok = _tok(_content(view, attr)) if attr else None
     out: List[str] = []
     for a, d in view.out.get(obj, []):
-        if d.get("edge_type") != "has_attribute":
+        if d.get("edge_type") != "has_attribute" or not _edge_ok(d):
             continue
         if attr:
             if a != attr and not (attr_tok and (_tok(_content(view, a)) & attr_tok)):
                 continue
         for v, d2 in view.out.get(a, []):
-            if d2.get("edge_type") == "has_value" and \
+            if d2.get("edge_type") == "has_value" and _edge_ok(d2) and \
                     view.nodes.get(v, {}).get("node_type") == NodeType.VALUE.value:
                 out.append(v)
                 if len(out) >= limit:
@@ -265,10 +282,72 @@ def values_via_attribute(
 def unit_of_value(view, value: str) -> str:
     """value --has_unit--> Unit；返回该数值真正的单位节点 (无则空串)。"""
     for u, d in view.out.get(value, []):
+        if d.get("edge_type") == "has_unit" and _edge_ok(d) and \
+                view.nodes.get(u, {}).get("node_type") == NodeType.UNIT.value:
+            return u
+    return ""
+
+
+def column_unit(view, col: str) -> str:
+    """表格列 (AttributeNode) --has_unit--> Unit；表格数值的单位挂在列头而非单元格。"""
+    for u, d in view.out.get(col, []):
         if d.get("edge_type") == "has_unit" and \
                 view.nodes.get(u, {}).get("node_type") == NodeType.UNIT.value:
             return u
     return ""
+
+
+def table_row_columns(view, row: str) -> Dict[str, str]:
+    """表格行 row 在各列上的取值：返回 {列节点(AttributeNode): 单元格(ValueNode)}。
+
+    表结构：列 --has_value--> 单元格；行 --(compares/co_occurs_with)--> 单元格。
+    取行邻接的每个单元格，回溯其所属列 (入边 has_value 来源)，得到 列→单元格 映射，
+    用于"比较题对象为表行、指标为共享列、值为该行该列单元格"的语义绑定。
+    """
+    out: Dict[str, str] = {}
+    for cell, _ in view.out.get(row, []):
+        for src, d in view.inc.get(cell, []):
+            if d.get("edge_type") == "has_value" and \
+                    view.nodes.get(src, {}).get("node_type") == NodeType.ATTRIBUTE.value:
+                out.setdefault(src, cell)
+                break
+    return out
+
+
+def as_table_row(view, nid: str) -> str:
+    """规范化为表行节点 (ConceptNode)，供比较题对象绑定。
+
+    行标签单元格 (r{N}c1) 与行节点同为 ConceptNode，类型匹配可能误选标签单元格作对象。
+    若 nid 本身即表行 (有指向单元格的 compares/co_occurs_with 出边) 则原样返回；
+    否则经入边回溯到包含它的行节点；无法定位时返回原 nid。
+    """
+    if table_row_columns(view, nid):
+        return nid
+    for src, d in view.inc.get(nid, []):
+        if d.get("edge_type") in ("compares", "co_occurs_with") and table_row_columns(view, src):
+            return src
+    return nid
+
+
+def shared_metric(view, row_a: str, row_b: str, prefer: str = ""):
+    """两表行共享的指标列及各自单元格：返回 (col, cell_a, cell_b)；无共享列返回 None。
+
+    优先沿用已选 prefer 列，否则优先取数值型单元格的列 (真正可比较的定量指标)。
+    """
+    cols_a = table_row_columns(view, row_a)
+    cols_b = table_row_columns(view, row_b)
+    shared = [c for c in cols_a if c in cols_b]
+    if not shared:
+        return None
+    col = prefer if prefer in shared else ""
+    if not col:
+        for c in shared:
+            if any(ch.isdigit() for ch in _content(view, cols_a[c])):
+                col = c
+                break
+        col = col or shared[0]
+    return col, cols_a[col], cols_b[col]
+
 
 
 def same_as_peers(view, nid: str, other_paper: bool = False) -> List[str]:

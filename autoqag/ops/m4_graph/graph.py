@@ -32,6 +32,8 @@ from autoqag.ops.base import BaseStage, PipelineContext
 from autoqag.ops.m4_graph.edge_rules import LABEL_TO_NODE_TYPE, resolve_edge
 from autoqag.ops.m4_graph.extractor import build_prompt, parse_extraction
 from autoqag.ops.m4_graph.quality import (
+    detect_polarity,
+    edge_confidence,
     is_meaningful_attribute,
     is_valid_point,
 )
@@ -450,6 +452,7 @@ class GraphStage(BaseStage):
             s, t = (id2, id1) if flip else (id1, id2)
         else:
             sem, s, t = "co_occurs_with", id1, id2
+        # 表格行列共现是结构化对齐，极性恒为正、按范围给置信度
         store.upsert_edge(
             Edge(
                 source=s,
@@ -460,6 +463,8 @@ class GraphStage(BaseStage):
                 paper_id=b.address.paper_id,
                 section_path=b.address.section_path,
                 chunk_id=b.address.chunk_id,
+                polarity="positive",
+                confidence=edge_confidence(scope, "positive"),
             )
         )
 
@@ -562,6 +567,11 @@ class GraphStage(BaseStage):
     ) -> None:
         is_caption = block.modality == Modality.CAPTION.value
 
+        # 反查 node_id → 原文 content，供极性检测在两提及之间定位窗口
+        id_to_content: Dict[str, str] = {}
+        for nm, (nid, _t) in name_to_id.items():
+            id_to_content[nid] = _content_of(points, nm)
+
         def scope(c1: str, c2: str) -> str:
             if is_caption:
                 return "same_caption"
@@ -570,8 +580,28 @@ class GraphStage(BaseStage):
                     return "same_sentence"
             return "same_chunk"
 
-        def add(id1: str, t1: str, id2: str, t2: str, sc: str, fallback: str) -> None:
-            """按 §三 规范化方向后落库；m5 据方向遍历不漏边。"""
+        def add(
+            id1: str,
+            t1: str,
+            id2: str,
+            t2: str,
+            sc: str,
+            fallback: str,
+            *,
+            rule_completion: bool = False,
+        ) -> None:
+            """按 §三 规范化方向后落库；m5 据方向遍历不漏边。
+
+            刀1 防护：在两提及窗口内检测极性。
+            - 规则补全边 (LLM 未断言) 且被否定/对比/假设 → 直接不建 (避免错误共现边)；
+            - LLM 断言的边即便极性非正也保留，但标 polarity 并降权，不进证据层；
+            - confidence 按共现范围 × 极性给出，下游据此做证据门控。
+            """
+            c1, c2 = id_to_content.get(id1, ""), id_to_content.get(id2, "")
+            polarity = detect_polarity(block.content, c1, c2)
+            if rule_completion and polarity != "positive":
+                return
+            conf = edge_confidence(sc, polarity, rule_completion=rule_completion)
             r = resolve_edge(t1, t2)
             if r:
                 sem, flip = r
@@ -589,6 +619,8 @@ class GraphStage(BaseStage):
                     section_path=block.address.section_path,
                     chunk_id=block.address.chunk_id,
                     evidence_span=block.content[:200],
+                    polarity=polarity,
+                    confidence=conf,
                 )
             )
 
@@ -602,7 +634,7 @@ class GraphStage(BaseStage):
             add(src[0], src[1], tgt[0], tgt[1], sc, r.get("relation") or "co_occurs_with")
             linked.add(frozenset((src[0], tgt[0])))
 
-        # 规则补全：同块内符合标签规则但 LLM 未连的点对
+        # 规则补全：同块内符合标签规则但 LLM 未连的点对 (纯共现，刀1 高危区)
         ids = list(name_to_id.values())
         for i in range(len(ids)):
             for j in range(i + 1, len(ids)):
@@ -610,7 +642,12 @@ class GraphStage(BaseStage):
                 if frozenset((id1, id2)) in linked:
                     continue
                 if resolve_edge(t1, t2):
-                    add(id1, t1, id2, t2, "same_caption" if is_caption else "same_chunk", "co_occurs_with")
+                    add(
+                        id1, t1, id2, t2,
+                        "same_caption" if is_caption else "same_chunk",
+                        "co_occurs_with",
+                        rule_completion=True,
+                    )
 
     # ---------------- 跨模态引用边 (§十.1) ----------------
     def _cross_modal_edges(self, store: GraphStore, blocks: List[EvidenceBlock]) -> int:

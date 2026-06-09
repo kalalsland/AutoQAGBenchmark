@@ -263,6 +263,9 @@ class Edge:
     evidence_span: str = ""
     weight: float = 1.0
     confidence: float = 1.0
+    # 极性：positive / negative / contrastive / hypothetical (图谱构建.pdf 刀1)。
+    # 非 positive 的共现边语义被原文否定/对比/假设，不得作为正向答案证据。
+    polarity: str = "positive"
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

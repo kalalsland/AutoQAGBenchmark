@@ -44,6 +44,11 @@ class OverlayPlanner:
         node_ok: Optional[Callable] = None,
         tau: float = 0.0,
         max_expand: int = 12,
+        use_score_guided: bool = True,
+        use_binding: bool = True,
+        use_overlay: bool = True,
+        use_dual_multihop: bool = True,
+        use_sufficiency: bool = True,
     ):
         self.view = view
         self.domain = domain
@@ -51,6 +56,12 @@ class OverlayPlanner:
         self.node_ok = node_ok
         self.tau = tau  # 纳入新节点所需的最小评分增益 (§3.4 Accept(v))
         self.max_expand = max_expand
+        # 消融开关 (默认全开=完整系统)；逐个关闭以度量各模块边际贡献 (见 exeriments/)。
+        self.use_score_guided = use_score_guided    # 评分引导扩展 Accept(v)
+        self.use_binding = use_binding              # 题型专属语义绑定
+        self.use_overlay = use_overlay              # 虚拟逻辑补全 Ωq
+        self.use_dual_multihop = use_dual_multihop  # 双重多跳 + 难度封顶
+        self.use_sufficiency = use_sufficiency      # 逻辑充分性硬门槛
 
     # ----------------------------------------------------------------- #
     def plan_one(self, qtype: str, seed_node: str, qid: str) -> Optional[QuestionPlan]:
@@ -71,21 +82,22 @@ class OverlayPlanner:
         # 4b. 题型专属语义绑定：把"值"沿物理边绑回"对象"，确保数值真正属于该对象
         #     (comparative: value_X 经 object_X 的 has_attribute/has_value 链；
         #      cross_paper: paper_B_instance / result_B 取自 same_as 对齐的他刊实例)
-        if qtype == "comparative":
-            self._bind_comparative(role_assignment, candidates)
-        elif qtype == "cross_paper":
-            self._bind_cross_paper(role_assignment, candidates)
-        elif qtype in ("numerical", "formula"):
-            # 单位绑定为数值真正的 has_unit 邻居，杜绝游离噪声单位 (如 unit='a')
-            u = ec.unit_of_value(view, role_assignment.get("value", ""))
-            role_assignment["unit"] = u if u else role_assignment.get("unit", "")
-            if u:
-                candidates.add(u)
+        if self.use_binding:
+            if qtype == "comparative":
+                self._bind_comparative(role_assignment, candidates)
+            elif qtype == "cross_paper":
+                self._bind_cross_paper(role_assignment, candidates)
+            elif qtype in ("numerical", "formula"):
+                # 单位绑定为数值真正的 has_unit 邻居，杜绝游离噪声单位 (如 unit='a')
+                u = ec.unit_of_value(view, role_assignment.get("value", ""))
+                role_assignment["unit"] = u if u else role_assignment.get("unit", "")
+                if u:
+                    candidates.add(u)
 
         # 5. 虚拟逻辑补全 (针对缺失角色)
         overlay: List[VirtualEdge] = []
         missing = scoring.missing_roles(qtype, role_assignment)
-        if missing:
+        if self.use_overlay and missing:
             overlay = self._virtual_completion(
                 qtype, goal.difficulty_level, role_assignment, missing, role_pool
             )
@@ -115,7 +127,9 @@ class OverlayPlanner:
         datas = view.datas(node_ids)
         path_len = max(0, len(node_ids) - 1)
         feats = difficulty_features(datas, path_len)
-        difficulty = _cap_difficulty(view, node_ids, compute_difficulty(feats), path_len)
+        difficulty = compute_difficulty(feats)
+        if self.use_dual_multihop:
+            difficulty = _cap_difficulty(view, node_ids, difficulty, path_len)
         goal.difficulty_level = difficulty
 
         edges = self._subgraph_edges(node_ids)
@@ -126,10 +140,13 @@ class OverlayPlanner:
 
         overlay_pattern = self._overlay_pattern(qtype, role_assignment)
 
-        # 7. 逻辑充分性 + 双重多跳验证
-        ok = scoring.logical_sufficiency(parts, qtype) and scoring.dual_multihop_ok(
-            view, node_ids, difficulty, path_len
+        # 7. 逻辑充分性 + 双重多跳验证 (消融时可分别关闭)
+        suff_ok = scoring.logical_sufficiency(parts, qtype) if self.use_sufficiency else True
+        dual_ok = (
+            scoring.dual_multihop_ok(view, node_ids, difficulty, path_len)
+            if self.use_dual_multihop else True
         )
+        ok = suff_ok and dual_ok
         if not ok:
             # 记录失败模式 (长期记忆)，丢弃该问题
             self.memory.record_pattern(overlay_pattern, success=False)
@@ -215,50 +232,82 @@ class OverlayPlanner:
         return self.node_ok(self.view, nid)
 
     def _bind_comparative(self, role_assignment: Dict[str, str], candidates) -> None:
-        """比较题语义绑定：让 value_A/value_B 真正属于 object_A/object_B。
+        """比较题语义绑定：让 value_A/value_B 真正属于 object_A/object_B 在同一指标上的取值。
 
-        类型匹配会把任意 Value 填进 value_A，导致"数值不属于被比较对象"。这里改为
-        沿 object_X --has_attribute--> (共享指标) --has_value--> value_X 物理链取值，
-        并把单位绑定为该数值的 has_unit 邻居 (杜绝 unit='a' 之类游离噪声单位)。
+        类型匹配会把任意 Value 填进 value_A，导致"数值不属于被比较对象"。两条物理路径：
+          表格路径 (本语料主导)：对象=表行，指标=共享列，值=该行该列单元格
+              (列 --has_value--> 单元格；行 --compares/co_occurs_with--> 单元格)；
+          通用链路：object_X --has_attribute--> 共享指标 --has_value--> value_X。
+        单位绑定为该数值的 has_unit，或表格列头的 has_unit (杜绝游离噪声单位如 'a')。
         """
         view = self.view
         objA = role_assignment.get("object_A")
         objB = role_assignment.get("object_B")
         if not objA or not objB:
             return
-        attr = role_assignment.get("shared_attribute", "")
-        attrsA, attrsB = ec.attributes_of(view, objA), ec.attributes_of(view, objB)
-        # 选一个两对象都拥有的共享指标 (按内容 token 重叠对齐)
-        attrA = attr if attr in attrsA else ""
-        attrB = attr if attr in attrsB else ""
-        if not (attrA and attrB) and attrsA and attrsB:
-            for x in attrsA:
-                xt = ec._tok(ec._content(view, x))
-                for y in attrsB:
-                    if xt and (xt & ec._tok(ec._content(view, y))):
-                        attrA, attrB = x, y
+
+        # 对象规范化：表行标签单元格与行节点同为 ConceptNode，统一回溯到行节点，
+        # 否则 shared_metric 取不到行的单元格映射 (绑定退化为类型匹配的错误值)。
+        objA = ec.as_table_row(view, objA)
+        objB = ec.as_table_row(view, objB)
+        if objA != role_assignment.get("object_A"):
+            role_assignment["object_A"] = objA
+            candidates.add(objA)
+        if objB != role_assignment.get("object_B"):
+            role_assignment["object_B"] = objB
+            candidates.add(objB)
+
+        # (1) 表格路径优先：两行共享列上的单元格才是"同一指标下的可比值"
+        sm = ec.shared_metric(view, objA, objB, prefer=role_assignment.get("shared_attribute", ""))
+        if sm:
+            col, cellA, cellB = sm
+            role_assignment["shared_attribute"] = col
+            candidates.add(col)
+            if self._val_ok(cellA):
+                role_assignment["value_A"] = cellA
+                candidates.add(cellA)
+            if self._val_ok(cellB):
+                role_assignment["value_B"] = cellB
+                candidates.add(cellB)
+            cu = ec.column_unit(view, col)
+            if cu:
+                role_assignment["unit"] = cu
+                candidates.add(cu)
+        else:
+            # (2) 通用链路：object--has_attribute-->共享指标-->has_value-->value
+            attr = role_assignment.get("shared_attribute", "")
+            attrsA, attrsB = ec.attributes_of(view, objA), ec.attributes_of(view, objB)
+            attrA = attr if attr in attrsA else ""
+            attrB = attr if attr in attrsB else ""
+            if not (attrA and attrB) and attrsA and attrsB:
+                for x in attrsA:
+                    xt = ec._tok(ec._content(view, x))
+                    for y in attrsB:
+                        if xt and (xt & ec._tok(ec._content(view, y))):
+                            attrA, attrB = x, y
+                            break
+                    if attrA and attrB:
                         break
-                if attrA and attrB:
+                if attrA:
+                    role_assignment["shared_attribute"] = attrA
+                    candidates.add(attrA)
+            valsA = [v for v in ec.values_via_attribute(view, objA, attrA) if self._val_ok(v)]
+            valsB = [v for v in ec.values_via_attribute(view, objB, attrB) if self._val_ok(v)]
+            if valsA:
+                role_assignment["value_A"] = valsA[0]
+                candidates.add(valsA[0])
+            if valsB:
+                role_assignment["value_B"] = valsB[0]
+                candidates.add(valsB[0])
+
+        # 单位绑定 (两路径通用)：先看数值自身 has_unit，再退化到列头单位
+        if not role_assignment.get("unit"):
+            for vrole in ("value_A", "value_B"):
+                u = ec.unit_of_value(view, role_assignment.get(vrole, ""))
+                if u:
+                    role_assignment["unit"] = u
+                    candidates.add(u)
                     break
-            if attrA:
-                role_assignment["shared_attribute"] = attrA
-                candidates.add(attrA)
-        # 经各自对象的共享指标取值；取不到则保留原类型匹配结果，不破坏角色完整性
-        valsA = [v for v in ec.values_via_attribute(view, objA, attrA) if self._val_ok(v)]
-        valsB = [v for v in ec.values_via_attribute(view, objB, attrB) if self._val_ok(v)]
-        if valsA:
-            role_assignment["value_A"] = valsA[0]
-            candidates.add(valsA[0])
-        if valsB:
-            role_assignment["value_B"] = valsB[0]
-            candidates.add(valsB[0])
-        # 单位绑定为数值真正的 has_unit (而非全局任取)
-        for vrole in ("value_A", "value_B"):
-            u = ec.unit_of_value(view, role_assignment.get(vrole, ""))
-            if u:
-                role_assignment["unit"] = u
-                candidates.add(u)
-                break
 
     def _real_instance(self, nid: str) -> bool:
         """是否为可作"论文实例"的真实节点 (Concept/Method/Value，且非噪声标签)。"""
@@ -443,6 +492,9 @@ class OverlayPlanner:
         # 候选按是否带物理地址 / 是否证据节点排序，优先纳入高价值证据节点
         extra = [c for c in candidates if c not in current]
         extra.sort(key=lambda c: _cand_priority(view, c), reverse=True)
+        if not self.use_score_guided:
+            # 消融：无评分引导，按优先级朴素纳入至上限 (不做 Accept(v) 增益门)
+            return current + extra[: self.max_expand]
         for c in extra:
             if len(current) >= len(base) + self.max_expand:
                 break

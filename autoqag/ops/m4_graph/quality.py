@@ -147,6 +147,134 @@ def is_meaningful_attribute(name: str) -> bool:
     return not (is_symbolic_name(name) or is_stopword_name(name))
 
 
+# --------------------------- 边极性 / 置信度 (图谱构建.pdf 刀1) ---------------------------
+# 纯共现建边的死穴：原文 "B does NOT improve PCE" / "Unlike A, B ..." 会被建成正向边。
+# 这里在建边前做句级极性检测，并按共现范围给边置信度，使被否定/对比/假设的边
+# 既被标记 (polarity)、又被降权 (confidence)，不进入正向答案证据层。
+
+# 否定线索 (英文)：not / n't / no / without / fail to / cannot / never / neither-nor / lack of / absence of
+_NEG_EN_RE = re.compile(
+    r"\b(?:not|no|never|without|cannot|none|neither|nor)\b"
+    r"|n['’]t\b"
+    r"|\bfail(?:s|ed|ing)?\s+to\b"
+    r"|\black(?:s|ed|ing)?\s+of\b"
+    r"|\babsence\s+of\b",
+    re.IGNORECASE,
+)
+# 对比 / 让步线索 (英文)
+_CONTRAST_EN_RE = re.compile(
+    r"\b(?:unlike|whereas|however|although|though|but|conversely)\b"
+    r"|\bin\s+contrast\b|\bcontrary\s+to\b|\brather\s+than\b|\binstead\s+of\b|\bas\s+opposed\s+to\b",
+    re.IGNORECASE,
+)
+# 假设 / 情态线索 (英文)：非实测、推测性
+_HYPO_EN_RE = re.compile(
+    r"\b(?:if|would|could|might|may|suppose|assuming|hypothetically|potentially)\b"
+    r"|\bexpected\s+to\b|\bis\s+expected\b|\bwere\s+to\b",
+    re.IGNORECASE,
+)
+# 中文线索 (保守集，避免 "无线/不锈" 等词内误命中)
+_NEG_ZH_RE = re.compile(r"没有|并非|并不|无法|未能|不能|不会|不是|不再|未(?=能|被|得到)|缺乏")
+_CONTRAST_ZH_RE = re.compile(r"然而|尽管|相反|而非|不同于|与之相反|却")
+_HYPO_ZH_RE = re.compile(r"假设|如果|若是|倘若|可能会|预计|有望")
+
+# 共现范围 → 基础置信度 (越紧密越可信)
+SCOPE_BASE_CONFIDENCE = {
+    "same_sentence": 1.0,
+    "same_table_row": 0.9,
+    "same_table_column": 0.9,
+    "same_caption": 0.85,
+    "same_paragraph": 0.7,
+    "same_chunk": 0.55,
+}
+# 同块 all-pairs 规则补全 (LLM 未断言该关系) 的基础置信度
+RULE_COMPLETION_CONFIDENCE = 0.4
+# 极性惩罚系数：非 positive 的边被原文否定/对比/假设，乘以低系数
+POLARITY_PENALTY = {
+    "positive": 1.0,
+    "hypothetical": 0.45,
+    "contrastive": 0.35,
+    "negative": 0.25,
+}
+# 证据层门控阈值：confidence >= 该值且 polarity == positive 才可作正向答案证据
+EVIDENCE_CONFIDENCE_THRESHOLD = 0.5
+
+
+def _between_window(text: str, span_a: str, span_b: str) -> str:
+    """取两个实体提及之间 (含少量左边距) 的子串，使极性检测局部化。
+
+    左边距 30 字符用于捕获前置对比/否定线索 (如 'Unlike A, ...')；
+    定位失败则回退到整段文本。
+    """
+    t = text or ""
+    if not t:
+        return ""
+    ha = (span_a or "").strip()[:20]
+    hb = (span_b or "").strip()[:20]
+    ia = t.lower().find(ha.lower()) if ha else -1
+    ib = t.lower().find(hb.lower()) if hb else -1
+    if ia < 0 or ib < 0:
+        return t  # 定位不到则扫全句/全块
+    lo, hi = sorted((ia, ib))
+    # hi 端补上第二个提及的长度
+    end = hi + max(len(ha), len(hb))
+    # 左侧留至多 30 字符边距以捕获前置对比/否定线索 (如 'Unlike A, ...')，
+    # 但不得跨句子边界 (.!?; 或中文句号)，否则会把上一句的否定误纳入窗口。
+    left = max(0, lo - 30)
+    margin = t[left:lo]
+    bpos = max(
+        margin.rfind("."), margin.rfind("!"), margin.rfind("?"),
+        margin.rfind(";"), margin.rfind("。"), margin.rfind("；"),
+    )
+    if bpos >= 0:
+        left = left + bpos + 1
+    return t[left: end + 5]
+
+
+def detect_polarity(text: str, span_a: str = "", span_b: str = "") -> str:
+    """检测两点之间共现关系的极性。
+
+    返回 positive / negative / contrastive / hypothetical。
+    优先级：否定 > 对比 > 假设 > 正向 (否定语义对证据最致命)。
+    span_a/span_b 给定时只在两提及之间的窗口检测，降低误命中。
+    """
+    window = _between_window(text, span_a, span_b)
+    if not window:
+        return "positive"
+    if _NEG_EN_RE.search(window) or _NEG_ZH_RE.search(window):
+        return "negative"
+    if _CONTRAST_EN_RE.search(window) or _CONTRAST_ZH_RE.search(window):
+        return "contrastive"
+    if _HYPO_EN_RE.search(window) or _HYPO_ZH_RE.search(window):
+        return "hypothetical"
+    return "positive"
+
+
+def edge_confidence(
+    scope: str,
+    polarity: str = "positive",
+    *,
+    rule_completion: bool = False,
+) -> float:
+    """边置信度 = 基础(共现范围或规则补全) × 极性惩罚。
+
+    rule_completion=True 表示该边来自同块 all-pairs 补全 (LLM 未断言)，基础置信度更低，
+    只服务召回层，默认不进证据层。
+    """
+    base = (
+        RULE_COMPLETION_CONFIDENCE
+        if rule_completion
+        else SCOPE_BASE_CONFIDENCE.get(scope, 0.5)
+    )
+    conf = base * POLARITY_PENALTY.get(polarity, 1.0)
+    return round(conf, 3)
+
+
+def is_evidence_eligible(confidence: float, polarity: str = "positive") -> bool:
+    """该边能否作为正向答案证据：置信度达标且极性为正。"""
+    return polarity == "positive" and confidence >= EVIDENCE_CONFIDENCE_THRESHOLD
+
+
 # --------------------------- QA 级过滤 ---------------------------
 def looks_like_node_id(s: str) -> bool:
     return bool(_NODE_ID_RE.search(s or ""))

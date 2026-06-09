@@ -70,6 +70,11 @@ class SemanticPlanStage(BaseStage):
         planner = OverlayPlanner(
             view, domain=domain, memory=memory, node_ok=_node_ok,
             tau=tau, max_expand=max_expand,
+            use_score_guided=bool(self.params.get("use_score_guided", True)),
+            use_binding=bool(self.params.get("use_binding", True)),
+            use_overlay=bool(self.params.get("use_overlay", True)),
+            use_dual_multihop=bool(self.params.get("use_dual_multihop", True)),
+            use_sufficiency=bool(self.params.get("use_sufficiency", True)),
         )
 
         plans: List[QuestionPlan] = []
