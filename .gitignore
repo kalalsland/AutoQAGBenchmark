@@ -38,3 +38,6 @@ mineru/
 .idea/
 .DS_Store
 Thumbs.db
+
+# 计时实验输入 PDF (体积大/版权，不入库)
+data/raw_timing/*.pdf

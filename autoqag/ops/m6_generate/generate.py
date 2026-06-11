@@ -14,9 +14,14 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, List
+import asyncio
+import json
+import time
+from typing import Any, Dict, List, Tuple
 
 from autoqag.common.io import read_jsonl_list, write_jsonl
+from autoqag.common.llm import _run_sync
+from autoqag.common.logging import logger
 from autoqag.ops.base import BaseStage, PipelineContext
 from autoqag.ops.m6_generate.json_utils import parse_json
 from autoqag.ops.m4_graph.quality import is_valid_qa
@@ -45,7 +50,13 @@ class GenerateStage(BaseStage):
 
         prompts = [self._build_prompt(p) for p in plans]
         self.log("LLM 生成 QA: %d 个 plan", len(prompts))
-        responses = ctx.llm.generate_batch(prompts)
+        if self.params.get("record_timing"):
+            responses, durations = _timed_generate_batch(ctx.llm, prompts)
+            self._write_timing_report(
+                ctx, [p.question_type for p in plans], durations
+            )
+        else:
+            responses = ctx.llm.generate_batch(prompts)
 
         qa_items: List[QAItem] = []
         refusals: List[Dict[str, Any]] = []
@@ -184,6 +195,86 @@ class GenerateStage(BaseStage):
             "output": q.answer or "文中无法确定",
             "reason": "insufficient_evidence",
         }
+
+    # ----- 分题型生成计时 -----
+    def _write_timing_report(
+        self,
+        ctx: PipelineContext,
+        types: List[str],
+        durations: List[float],
+    ) -> None:
+        """按题型汇总单次 LLM 调用墙钟耗时，写 generate_timing.json。
+
+        口径：每个 plan 的单次 agenerate 调用 (提交→返回) 的墙钟时长，
+        受 max_concurrency 并发影响。per_type 给出各题型平均/总/计数。
+        """
+        per_type: Dict[str, List[float]] = {}
+        for t, d in zip(types, durations):
+            per_type.setdefault(t, []).append(d)
+
+        type_stats: Dict[str, Dict[str, float]] = {}
+        for t, ds in per_type.items():
+            ds_sorted = sorted(ds)
+            type_stats[t] = {
+                "count": len(ds),
+                "avg_sec": round(sum(ds) / len(ds), 3),
+                "min_sec": round(ds_sorted[0], 3),
+                "max_sec": round(ds_sorted[-1], 3),
+                "total_sec": round(sum(ds), 3),
+            }
+        report = {
+            "max_concurrency": ctx.llm.max_concurrency,
+            "model": ctx.llm.model,
+            "n_calls": len(durations),
+            "wall_sum_sec": round(sum(durations), 3),
+            "avg_per_call_sec": round(sum(durations) / len(durations), 3)
+            if durations
+            else 0.0,
+            "by_type": type_stats,
+        }
+        out = ctx.path("generate_timing.json")
+        with open(out, "w", encoding="utf-8") as f:
+            json.dump(report, f, ensure_ascii=False, indent=2)
+        self.log("分题型生成计时已写入 generate_timing.json")
+        for t, s in sorted(type_stats.items()):
+            self.log(
+                "  [%s] n=%d avg=%.2fs (min=%.2f max=%.2f)",
+                t,
+                s["count"],
+                s["avg_sec"],
+                s["min_sec"],
+                s["max_sec"],
+            )
+
+
+def _timed_generate_batch(
+    llm, prompts: List[str]
+) -> Tuple[List[str], List[float]]:
+    """并发跑 batch，同时记录每次调用的墙钟耗时 (与 generate_batch 等价的并发模型)。"""
+    n = len(prompts)
+    durations: List[float] = [0.0] * n
+
+    async def _one(i: int, text: str) -> str:
+        t0 = time.perf_counter()
+        try:
+            r = await llm.agenerate(text)
+        except Exception as e:  # 与 generate_batch 一致：失败计空串
+            logger.error("LLM batch item failed: %s", e)
+            r = ""
+        durations[i] = time.perf_counter() - t0
+        return r
+
+    async def _all():
+        return await asyncio.gather(
+            *[_one(i, t) for i, t in enumerate(prompts)], return_exceptions=True
+        )
+
+    results = _run_sync(_all())
+    out: List[str] = []
+    for r in results:
+        out.append("" if isinstance(r, Exception) else r)
+    return out, durations
+
 
 
 def _format_evidence(spans: List[Dict[str, Any]]) -> str:

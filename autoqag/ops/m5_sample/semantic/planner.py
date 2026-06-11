@@ -535,21 +535,29 @@ class OverlayPlanner:
             }
             for nid in node_ids if nid in view.nodes
         ]
-        constraints = {"number": [], "unit": [], "condition": [], "formula": [], "table": []}
+        constraints = {"number": [], "unit": [], "condition": [], "formula": [], "table": [], "value_units": []}
+        bound_units: List[str] = []
         for nid in node_ids:
             d = view.nodes.get(nid, {})
             nt = d.get("node_type")
             c = d.get("content", "")
             if nt == NodeType.VALUE.value:
                 constraints["number"].append(c)
-            elif nt == NodeType.UNIT.value:
-                constraints["unit"].append(c)
+                # 单位绑定：取该数值真正的 has_unit；无则退化到所属表列头的 has_unit。
+                # 杜绝把子图里游离的单位节点 (如别的值/表头的 GHz) 张冠李戴到本数值。
+                uid = ec.resolve_value_unit(view, nid)
+                u = view.nodes.get(uid, {}).get("content", "") if uid else ""
+                constraints["value_units"].append({"value": c, "unit": u})
+                if u and u not in bound_units:
+                    bound_units.append(u)
             elif nt == NodeType.CONDITION.value:
                 constraints["condition"].append(c)
             elif nt == NodeType.EQUATION.value:
                 constraints["formula"].append(c[:80])
             elif nt == NodeType.TABLE.value:
                 constraints["table"].append(c[:80])
+        # unit 列表只收与子图内某个数值真正绑定的单位，剔除游离单位节点 (修复 value↔unit 错标)
+        constraints["unit"] = bound_units
 
         papers = list({view.nodes.get(n, {}).get("address", {}).get("paper_id", "") for n in node_ids})
         required_paths = [e.backing_evidence_paths[0] for e in overlay if e.backing_evidence_paths]

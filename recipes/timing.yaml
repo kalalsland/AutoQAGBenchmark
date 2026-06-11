@@ -1,0 +1,69 @@
+# 计时专用 recipe（缩减规模）：5 篇 PDF + per_type 5。
+# 目的：测量 pdf抽取(parse) / 物理图建立(graph) / 子图构建(sample) / 问题生成(generate)
+#       各环节耗时，以及分题型平均单题生成时间。
+# 运行：python scripts/run_timed_pipeline.py --recipe recipes/timing.yaml
+
+work_dir: outputs/timing
+
+global_params:
+  domain: materials
+  llm:
+    model: gpt-4o-mini
+    temperature: 0.0
+    max_concurrency: 8
+    rpm: 1000
+    tpm: 50000
+
+pipeline:
+  - stage: ingest
+    params:
+      input_dir: data/raw_timing
+      recursive: false
+
+  - stage: parse
+    params:
+      backend: pipeline
+      method: auto
+      device: cpu
+      fallback: pymupdf
+      fallback_on_low: true
+
+  - stage: normalize
+    params:
+      normalize_units: true
+
+  - stage: graph
+    params:
+      extract_points: true
+      lang: en
+      cross_paper: true
+      max_text_blocks: 40   # 计时跑：限制文本块数量，保证 graph 阶段可控
+
+  - stage: sample
+    params:
+      per_type: 5
+      types: [atomic, numerical, condition, comparative, table, formula, multi_hop, summary]
+
+  - stage: generate
+    params:
+      record_timing: true   # 开启分题型单次 LLM 调用计时 → generate_timing.json
+
+  - stage: corrupt
+    params:
+      per_qa: 2
+      seed: 42
+
+  - stage: verify
+    params:
+      numerical_check: true
+      unit_check: true
+      condition_check: true
+      evidence_check: true
+      semantic_check: false
+
+  - stage: repair
+    params:
+      max_rounds: 3
+
+  - stage: output
+    params: {}

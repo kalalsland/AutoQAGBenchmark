@@ -297,6 +297,24 @@ def column_unit(view, col: str) -> str:
     return ""
 
 
+def resolve_value_unit(view, value: str) -> str:
+    """解析数值真正的单位节点 id：先取数值自身 has_unit，再退化到其所属表列头的 has_unit。
+
+    用于构造约束时把单位绑定到各自的数值，杜绝把子图里游离的单位节点
+    (如同表/同段别的值的单位) 张冠李戴到本数值上 (value↔unit 错标 bug)。
+    """
+    uid = unit_of_value(view, value)
+    if uid:
+        return uid
+    for src, d in view.inc.get(value, []):
+        if d.get("edge_type") == "has_value" and \
+                view.nodes.get(src, {}).get("node_type") == NodeType.ATTRIBUTE.value:
+            cu = column_unit(view, src)
+            if cu:
+                return cu
+    return ""
+
+
 def table_row_columns(view, row: str) -> Dict[str, str]:
     """表格行 row 在各列上的取值：返回 {列节点(AttributeNode): 单元格(ValueNode)}。
 
