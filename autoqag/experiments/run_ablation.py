@@ -35,7 +35,10 @@ from autoqag.ops.m5_sample.semantic_plan import SemanticPlanStage
 from autoqag.experiments.metrics_internal import compute_internal, load_view
 
 # 累积开关顺序：逐行向右多开一个模块
-_ORDER = ["use_score_guided", "use_binding", "use_overlay", "use_dual_multihop", "use_sufficiency"]
+_ORDER = [
+    "use_score_guided", "use_binding", "use_overlay",
+    "use_core_edges", "use_compat_gate", "use_dual_multihop", "use_sufficiency",
+]
 
 
 def _toggles(n_on: int) -> Dict[str, bool]:
@@ -51,8 +54,10 @@ def ablation_configs(per_type: int) -> List[Tuple[str, str, Dict[str, Any]]]:
         ("A2_score_guided", "semantic_plan", sp(1)),
         ("A3_binding", "semantic_plan", sp(2)),
         ("A4_overlay", "semantic_plan", sp(3)),
-        ("A5_dual_multihop", "semantic_plan", sp(4)),
-        ("A6_full_plan", "semantic_plan", sp(5)),
+        ("A5_core_edges", "semantic_plan", sp(4)),
+        ("A6_compat_gate", "semantic_plan", sp(5)),
+        ("A7_dual_multihop", "semantic_plan", sp(6)),
+        ("A8_full_plan", "semantic_plan", sp(7)),
     ]
 
 

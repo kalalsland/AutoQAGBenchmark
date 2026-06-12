@@ -13,7 +13,8 @@ from typing import Any, Dict, List, Optional, Set
 
 from autoqag.ops.m4_graph.quality import is_valid_point
 from autoqag.ops.m5_sample.semantic import evidence_chain as ec
-from autoqag.schema import NodeType, QuestionType, VirtualEdge, VirtualEdgeType
+from autoqag.ops.m5_sample.semantic import roles as R
+from autoqag.schema import InferenceOp, NodeType, QuestionType, VirtualEdge, VirtualEdgeType
 
 # Score_q(e) 权重 (语义层子图构建.pdf §3.3.4)；可按题型覆写
 _SCORE_WEIGHTS = {
@@ -63,7 +64,63 @@ def _paper(view, nid: str) -> str:
 # ---------------------------------------------------------------------------
 # 候选虚拟边生成 (针对缺失角色 / 题型意图)
 # ---------------------------------------------------------------------------
-def propose_virtual_edges(
+# ---------------------------------------------------------------------------
+# 核心推断边 always 铺设 (operational_flow.md §3.6.0)
+# ---------------------------------------------------------------------------
+def propose_core_edges(
+    view,
+    qtype: str,
+    role_assignment: Dict[str, str],
+    role_pool: Dict[str, List[str]],
+) -> List[VirtualEdge]:
+    """按题型核心推断算子铺设核心虚拟边 (即使最小角色集已填满也建)。
+
+    核心边承载题目要求做的那一步推断 (COMPARISON / CAUSAL_CHAIN / ...)，其两端取自
+    已绑定的角色节点；若角色尚空则跳过该核心边 (留待补全边或证据接地后由 planner 重试)。
+    """
+    spec = R.core_inference(qtype)
+    op = str(spec.get("op", "") or "")
+    edges: List[VirtualEdge] = []
+    if not op:
+        return edges
+    for src_role, tgt_role, vtype, qrole in spec.get("edges", []):  # type: ignore[union-attr]
+        src = role_assignment.get(src_role)
+        tgt = role_assignment.get(tgt_role)
+        if not src or not tgt or src == tgt:
+            continue
+        edges.append(
+            VirtualEdge(
+                source=src, target=tgt, virtual_type=vtype,
+                question_role=qrole, inference_op=op, is_core=True,
+                posited_relation=_posited(view, op, src, tgt, role_assignment),
+                reason=f"核心推断边 ({op})：题型 {qtype} 要求的推理主干",
+            )
+        )
+    return edges
+
+
+def _posited(view, op: str, src: str, tgt: str, role_assignment: Dict[str, str]) -> str:
+    """人读的被推断关系串 (诊断用)。"""
+    s = _content(view, src) or src
+    t = _content(view, tgt) or tgt
+    attr = _content(view, role_assignment.get("shared_attribute", "")) if role_assignment.get("shared_attribute") else ""
+    if op == InferenceOp.COMPARISON.value:
+        return f"compare({s}, {t}){' on ' + attr if attr else ''}"
+    if op == InferenceOp.CROSS_PAPER_ALIGN.value:
+        return f"align&compare({s} @paperA, {t} @paperB)"
+    if op == InferenceOp.CAUSAL_CHAIN.value:
+        return f"{s} --causes--> {t}"
+    if op == InferenceOp.CONDITION_BIND.value:
+        return f"{s} holds only under {t}"
+    if op == InferenceOp.VISUAL_GROUNDING.value:
+        return f"{s} grounded by visual {t}"
+    return f"{op}({s}, {t})"
+
+
+# ---------------------------------------------------------------------------
+# 缺失角色补全边 (operational_flow.md §3.6.1；原 propose_virtual_edges)
+# ---------------------------------------------------------------------------
+def propose_completion_edges(
     view,
     qtype: str,
     role_assignment: Dict[str, str],
@@ -71,8 +128,9 @@ def propose_virtual_edges(
     role_pool: Dict[str, List[str]],
     max_per_role: int = 3,
 ) -> List[VirtualEdge]:
-    """根据缺失角色与题型，提出候选虚拟边 (语义规划层方法论.pdf §3.6 表)。"""
+    """根据缺失角色与题型，提出候选补全虚拟边 (operational_flow.md §3.6.1 表)。"""
     edges: List[VirtualEdge] = []
+    core_op = R.core_inference_op(qtype)
 
     def add(src, tgt, vtype, role, reason):
         if not src or not tgt or src == tgt:
@@ -80,7 +138,7 @@ def propose_virtual_edges(
         edges.append(
             VirtualEdge(
                 source=src, target=tgt, virtual_type=vtype,
-                question_role=role, reason=reason,
+                question_role=role, reason=reason, inference_op=core_op,
             )
         )
 
@@ -195,7 +253,16 @@ def score_edge(view, edge: VirtualEdge, qtype: str, difficulty: str) -> float:
         evidence_diversity += 0.5
     # 难度增益：高难度题更看重跨证据
     difficulty_gain = {"L1": 0.0, "L2": 0.3, "L3": 0.6, "L4": 1.0}.get(difficulty, 0.3) * evidence_diversity
-    condition_coverage = 1.0 if view.nodes.get(edge.target, {}).get("node_type") == NodeType.CONDITION.value else 0.0
+    # 条件覆盖：优先用条件兼容门结果 (operational_flow.md §3.6)；无则退回 target 是否 Condition
+    compat_status = edge.compatibility.get("status") if edge.compatibility else None
+    if compat_status == "ok":
+        condition_coverage = 1.0
+    elif compat_status == "weak":
+        condition_coverage = 0.5
+    elif compat_status == "conflict":
+        condition_coverage = 0.0
+    else:
+        condition_coverage = 1.0 if view.nodes.get(edge.target, {}).get("node_type") == NodeType.CONDITION.value else 0.0
     shortcut_risk = 1.0 if _same_chunk(view, edge.source, edge.target) else 0.0
     ambiguity_risk = 1.0 - schema_compatibility
 
@@ -233,13 +300,47 @@ def _schema_compatible(view, edge: VirtualEdge) -> float:
 # ---------------------------------------------------------------------------
 # 证据可回落验证 (§3.4.2)
 # ---------------------------------------------------------------------------
-def validate_backing(view, edge: VirtualEdge, max_depth: int = 4) -> VirtualEdge:
-    """为虚拟边寻找物理证据回落路径；找到则 accepted，否则 rejected。"""
+# ---------------------------------------------------------------------------
+# 证据可回落验证 + 条件兼容门 + 核心边反捷径 (operational_flow.md §3.6)
+# ---------------------------------------------------------------------------
+_COMPAT_OPS = {InferenceOp.COMPARISON.value, InferenceOp.CROSS_PAPER_ALIGN.value}
+
+
+def validate_backing(
+    view,
+    edge: VirtualEdge,
+    difficulty: str = "",
+    compat_nodes: Optional[tuple] = None,
+    max_depth: int = 4,
+) -> VirtualEdge:
+    """为虚拟边寻找物理凭据路径并施加三道门 (operational_flow.md §3.6)：
+
+    1) 证据可回落 (硬条件)：凭据路径只走可作证据的正向边；找不到 → rejected。
+    2) 条件兼容门 (硬门槛，仅 COMPARISON / CROSS_PAPER_ALIGN)：两操作数条件冲突 → rejected。
+       compat_nodes=(node_a, node_b) 显式指定承载条件的操作数 (通常是 value_A/value_B)；
+       缺省时退回用 edge.source / edge.target。
+    3) 核心边反捷径 (硬门槛)：is_core 且目标难度 L3/L4 时，凭据触及 chunk < 2 → rejected。
+    """
     path = ec.find_backing_path(view, edge.source, edge.target, max_depth=max_depth)
-    if path:
-        edge.backing_evidence_paths = [path]
-        edge.required_physical_nodes = path
-        edge.status = "accepted"
-    else:
+    if not path:
         edge.status = "rejected"
+        return edge
+    edge.backing_evidence_paths = [path]
+    edge.required_physical_nodes = path
+    edge.backing_chunks = ec.path_chunks(view, path)
+    edge.status = "accepted"
+
+    # 条件兼容门
+    if edge.inference_op in _COMPAT_OPS:
+        na, nb = compat_nodes if compat_nodes else (edge.source, edge.target)
+        status, reason = ec.condition_compatible(view, na, nb)
+        edge.compatibility = {"status": status, "reason": reason}
+        if status == "conflict":
+            edge.status = "rejected"
+            return edge
+
+    # 核心边反捷径：高难度核心推断边凭据必须跨 ≥2 chunk
+    if edge.is_core and difficulty in ("L3", "L4") and len(edge.backing_chunks) < 2:
+        edge.status = "rejected"
+        edge.reason += " | 反捷径硬拒：高难度核心边凭据未跨 ≥2 chunk"
     return edge

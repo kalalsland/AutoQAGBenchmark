@@ -160,3 +160,48 @@ CHECKERS = {
     "condition_check": check_condition,
     "evidence_check": check_evidence,
 }
+
+
+# ---------------------------------------------------------------------------
+# 遮蔽测试 (operational_flow.md §4.1)：行为级反伪多跳。
+# 删除 masking_spec.drop_operand 指定的证据节点后，若强模型仍能复现答案，
+# 说明该题不真正依赖被删证据 (伪多跳 / 可走捷径) → 违规。
+# 与上面纯函数 checker 不同，遮蔽测试需 LLM 重答，故由 VerifyStage 在
+# masking_check=True 时驱动 (默认关闭)；本处提供其纯函数辅助件。
+# ---------------------------------------------------------------------------
+def masked_evidence_text(qa: QAItem, drop_node_ids: List[str]) -> str:
+    """构造删除指定证据节点后的证据文本 (供遮蔽重答)。"""
+    drop = set(drop_node_ids or [])
+    return " ".join(
+        (e.get("content") or "")
+        for e in qa.evidence_spans
+        if e.get("node_id") not in drop
+    )
+
+
+def answer_recoverable(gold_answer: str, masked_answer: str) -> bool:
+    """删证据后是否仍能复现答案 (数值命中 或 高 token 重叠)。"""
+    if is_refusal(masked_answer):
+        return False  # 模型在缺证据时合法拒答 → 题确实依赖被删证据
+    gold_nums = set(_NUM_RE.findall(gold_answer or ""))
+    if gold_nums:
+        masked_nums = set(_NUM_RE.findall(masked_answer or ""))
+        if any(any(_nums_close(g, m) for m in masked_nums) for g in gold_nums):
+            return True
+    gt = set(re.findall(r"[0-9a-zA-Z一-鿿]{2,}", (gold_answer or "").lower()))
+    mt = set(re.findall(r"[0-9a-zA-Z一-鿿]{2,}", (masked_answer or "").lower()))
+    if not gt:
+        return False
+    return len(gt & mt) / len(gt) >= 0.6
+
+
+def make_masking_violation(qa: QAItem, dropped: List[str], kind: str) -> Violation:
+    return Violation(
+        qid=qa.qid,
+        layer=VerifyLayer.GRAPH.value,
+        field="masking",
+        expected=f"unanswerable after removing {kind} evidence {dropped[:4]}",
+        actual="answer still recoverable without the masked evidence (伪多跳/捷径)",
+        severity="major",
+        repair_hint="该题可不依赖关键证据作答，应降级难度或重规划为真正的多跳题",
+    )

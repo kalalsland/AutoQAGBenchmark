@@ -389,23 +389,34 @@ def same_as_peers(view, nid: str, other_paper: bool = False) -> List[str]:
     return list(dict.fromkeys(peers))
 
 
-def find_backing_path(view, source: str, target: str, max_depth: int = 4) -> List[str]:
-    """为一条虚拟边寻找物理证据回落路径 (§3.4.2)。
+def find_backing_path(
+    view, source: str, target: str, max_depth: int = 4, eligible_only: bool = True
+) -> List[str]:
+    """为一条虚拟边寻找物理证据回落路径 (operational_flow.md §3.6)。
 
     在 G0 上 (无向意义) BFS 找 source→target 的物理/结构路径。找到则返回 node_id 列表，
     否则返回 []。这是虚拟边能否进入最终问题子图的硬条件。
+
+    eligible_only=True 时只走"可作证据的正向边" (极性为正、置信达标)，杜绝虚拟边
+    靠一条被否定的共现边接地 (如 "B does not reach 30%")。结构边 (contains 等无
+    polarity 字段) 默认放行 (_edge_ok 对缺字段返回 True)。
     """
     if source == target:
         return [source]
     if source not in view.nodes or target not in view.nodes:
         return []
-    # 双向邻接 (物理证据图的边方向不应限制证据可达性)
+
+    def _ok(d: Dict[str, Any]) -> bool:
+        return _edge_ok(d) if eligible_only else True
+
+    # 双向邻接 (物理证据图的边方向不应限制证据可达性)；按边可作证据过滤
     prev: Dict[str, str] = {source: ""}
     frontier = [source]
     for _ in range(max_depth):
         nxt = []
         for cur in frontier:
-            nbrs = [t for t, _ in view.out.get(cur, [])] + [s for s, _ in view.inc.get(cur, [])]
+            nbrs = [t for t, d in view.out.get(cur, []) if _ok(d)] + \
+                   [s for s, d in view.inc.get(cur, []) if _ok(d)]
             for nb in nbrs:
                 if nb in prev:
                     continue
@@ -421,3 +432,102 @@ def find_backing_path(view, source: str, target: str, max_depth: int = 4) -> Lis
         if not frontier:
             break
     return []
+
+
+def path_chunks(view, path: List[str]) -> List[str]:
+    """凭据路径触及的 chunk 集合 (供难度/遮蔽/反捷径判断；operational_flow.md §3.6)。
+
+    每个节点的 address.chunk_id 即其物理证据 span；ChunkNode 自身的 node_id 即 chunk_id。
+    """
+    chunks: List[str] = []
+    for nid in path or []:
+        d = view.nodes.get(nid, {})
+        cid = d.get("address", {}).get("chunk_id", "")
+        if not cid and d.get("node_type") == NodeType.CHUNK.value:
+            cid = nid
+        if cid and cid not in chunks:
+            chunks.append(cid)
+    return chunks
+
+
+def conditions_of(view, nid: str) -> List[str]:
+    """取节点经 under_condition 关联的 ConditionNode (双向；仅可作证据的正向边)。"""
+    out: List[str] = []
+    for t, d in view.out.get(nid, []):
+        if d.get("edge_type") == "under_condition" and _edge_ok(d) and \
+                view.nodes.get(t, {}).get("node_type") == NodeType.CONDITION.value:
+            out.append(t)
+    for s, d in view.inc.get(nid, []):
+        if d.get("edge_type") == "under_condition" and _edge_ok(d) and \
+                view.nodes.get(s, {}).get("node_type") == NodeType.CONDITION.value:
+            out.append(s)
+    return list(dict.fromkeys(out))
+
+
+# 条件维度判定 (粗粒度归一化；同维度才比较)。operational_flow.md §3.5/§3.6 条件兼容门。
+# 用正则捕获"数值+单位"的常见写法 (如 85C / 25 °C / 300K / 1.5 sun)，关键词兜底。
+import re as _re
+
+_COND_DIM_PATTERNS = {
+    "temperature": _re.compile(
+        r"(\d+\s*°?\s*[ck]\b|℃|°c|celsius|kelvin|temperature|温度|aging|老化|anneal)", _re.I
+    ),
+    "time": _re.compile(r"(\d+\s*(hours?|hrs?|mins?|minutes?|sec|seconds?|days?|h|s)\b|duration|time|时间|小时|天)", _re.I),
+    "pressure": _re.compile(r"(\d+\s*(pa|kpa|mpa|bar|atm|torr)\b|pressure|压强|压力)", _re.I),
+    "concentration": _re.compile(r"(\d+\s*(mol|mm|m|wt%|vol%|ppm)\b|concentration|浓度)", _re.I),
+    "illumination": _re.compile(r"(am\s*1\.5|\d+\s*sun|\d+\s*mw/cm|illumination|光照|irradiance)", _re.I),
+    "frequency": _re.compile(r"(\d+\s*(ghz|mhz|thz|hz)\b|frequency|频率)", _re.I),
+    "humidity": _re.compile(r"(\d+\s*%?\s*rh\b|humidity|湿度)", _re.I),
+}
+
+
+def _cond_dim(text: str) -> str:
+    t = text or ""
+    for dim, pat in _COND_DIM_PATTERNS.items():
+        if pat.search(t):
+            return dim
+    return ""
+
+
+def _num_in(text: str):
+    """抽取文本中第一个数 (粗略，用于同维度同值近似判断)。"""
+    m = _re.search(r"-?\d+(?:\.\d+)?", text or "")
+    return float(m.group()) if m else None
+
+
+def condition_compatible(view, node_a: str, node_b: str):
+    """两操作数的适用条件是否兼容 (operational_flow.md §3.5/§3.6 条件兼容门)。
+
+    返回 (status, reason)：
+      "ok"      —— 无冲突 (无共同维度，或同维度同值/可换算)
+      "weak"    —— 一端有条件、另一端无 (降权，不硬拒)
+      "conflict"—— 同维度但取值明显不同 (硬拒：杜绝伪可比题)
+
+    判定刻意保守：只在"同维度且数值明显不同"时判 conflict，避免误杀合法题。
+    """
+    ca = [_content(view, c) for c in conditions_of(view, node_a)]
+    cb = [_content(view, c) for c in conditions_of(view, node_b)]
+    if not ca and not cb:
+        return "ok", "both unconditioned"
+    if bool(ca) != bool(cb):
+        return "weak", "one side has condition, the other does not"
+    # 两端都有条件：按维度配对比较
+    dims_a = {}
+    for c in ca:
+        d = _cond_dim(c)
+        if d:
+            dims_a.setdefault(d, []).append(c)
+    dims_b = {}
+    for c in cb:
+        d = _cond_dim(c)
+        if d:
+            dims_b.setdefault(d, []).append(c)
+    shared = set(dims_a) & set(dims_b)
+    for dim in shared:
+        na = next((_num_in(x) for x in dims_a[dim] if _num_in(x) is not None), None)
+        nb = next((_num_in(x) for x in dims_b[dim] if _num_in(x) is not None), None)
+        if na is not None and nb is not None:
+            hi = max(abs(na), abs(nb), 1e-9)
+            if abs(na - nb) / hi > 0.1:  # 同维度数值差异 >10% → 不可比
+                return "conflict", f"{dim}: {na} vs {nb}"
+    return "ok", "compatible on shared dimensions"

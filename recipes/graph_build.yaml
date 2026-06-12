@@ -1,0 +1,36 @@
+# 完整图谱构建 recipe (ingest → parse → normalize → graph)。
+# 用 DashScope OpenAI 兼容端点 + Qwen 抽点；其余与 five.yaml 一致。
+# 运行：python -m autoqag.pipeline --recipe recipes/graph_build.yaml --to graph
+
+work_dir: outputs/full_graph
+
+global_params:
+  domain: metamaterials
+  llm:
+    model: qwen-plus
+    max_concurrency: 6
+
+pipeline:
+  - stage: ingest
+    params:
+      input_dir: data/five
+      recursive: false
+
+  - stage: parse
+    params:
+      backend: pipeline
+      method: auto
+      device: cpu
+      fallback: pymupdf
+      fallback_on_low: true
+
+  - stage: normalize
+    params:
+      normalize_units: true
+
+  - stage: graph
+    params:
+      extract_points: true
+      max_text_blocks: 120
+      parse_table_cells: true
+      cross_paper: true

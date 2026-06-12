@@ -12,10 +12,27 @@ from typing import Any, Dict, List
 from autoqag.common.io import read_jsonl_list, write_jsonl
 from autoqag.ops.base import BaseStage, PipelineContext
 from autoqag.ops.m6_generate.json_utils import parse_json
-from autoqag.ops.m8_verify.verifiers import CHECKERS, _evidence_text, is_refusal
+from autoqag.ops.m8_verify.verifiers import (
+    CHECKERS,
+    _evidence_text,
+    answer_recoverable,
+    is_refusal,
+    make_masking_violation,
+    masked_evidence_text,
+)
 from autoqag.registry import STAGES
 from autoqag.schema import QAItem, Violation, VerifyLayer
 from autoqag.templates.verify_repair import SEMANTIC_VERIFY_PROMPT
+
+# 遮蔽测试重答提示 (§4.1)：只许用给定 (已删除关键证据的) 证据作答，
+# 无法确定须明确拒答——若仍答出原答案则暴露伪多跳/捷径。
+_MASKING_PROMPT = (
+    "仅根据下面提供的证据回答问题；若证据不足以确定答案，请只回答“无法从文中确定”。\n"
+    "不得使用证据之外的任何知识。\n\n"
+    "问题：{question}\n\n"
+    "证据：\n{evidence}\n\n"
+    "答案："
+)
 
 
 @STAGES.register_module("verify")
@@ -38,6 +55,7 @@ class VerifyStage(BaseStage):
             if self.params.get(name, True)
         ]
         semantic_check = self.params.get("semantic_check", False)
+        masking_check = self.params.get("masking_check", False)
 
         all_violations: List[Violation] = []
         passed = failed = 0
@@ -56,6 +74,34 @@ class VerifyStage(BaseStage):
             self.log("LLM 语义验证: %d 条", len(prompts))
             resp = ctx.llm.generate_batch(prompts)
             semantic_results = [parse_json(r) or {} for r in resp]
+
+        # 遮蔽层批量调用 (可选；行为级反伪多跳 §4.1)：
+        # 对每条带 masking_spec 的 QA，删除 drop_operand 证据后让强模型重答，
+        # 仍能复现答案则判伪多跳。trials 收集 (qa_index, kind, dropped, prompt)。
+        masking_trials: List[Dict[str, Any]] = []
+        masking_results: List[str] = []
+        if masking_check:
+            for i, q in enumerate(qa_items):
+                if is_refusal(q.answer) or not q.masking_spec:
+                    continue
+                for kind in ("drop_operand", "drop_cross_chunk"):
+                    dropped = q.masking_spec.get(kind) or []
+                    if not dropped:
+                        continue
+                    masked_ev = masked_evidence_text(q, dropped)
+                    prompt = _MASKING_PROMPT.format(question=q.question, evidence=masked_ev)
+                    masking_trials.append({"qa_index": i, "kind": kind, "dropped": dropped, "prompt": prompt})
+            if masking_trials:
+                self.log("遮蔽测试重答: %d 次", len(masking_trials))
+                masking_results = ctx.llm.generate_batch([t["prompt"] for t in masking_trials])
+
+        # qa_index -> 该题的遮蔽违规列表
+        masking_viol_by_idx: Dict[int, List[Violation]] = {}
+        for t, ans in zip(masking_trials, masking_results):
+            if answer_recoverable(qa_items[t["qa_index"]].answer, ans or ""):
+                masking_viol_by_idx.setdefault(t["qa_index"], []).append(
+                    make_masking_violation(qa_items[t["qa_index"]], t["dropped"], t["kind"])
+                )
 
         for i, qa in enumerate(qa_items):
             # 合法拒答 (证据不足) 直接通过：约束层不适用，避免误入 human_review
@@ -90,10 +136,16 @@ class VerifyStage(BaseStage):
                         )
                     )
 
+            # 遮蔽层违规 (行为级反伪多跳)
+            if masking_check and i in masking_viol_by_idx:
+                violations.extend(masking_viol_by_idx[i])
+
             qa.validator_result = {
                 "passed": len(violations) == 0,
                 "n_violations": len(violations),
-                "layers_checked": enabled + (["semantic"] if semantic_check else []),
+                "layers_checked": enabled
+                + (["semantic"] if semantic_check else [])
+                + (["masking"] if masking_check else []),
                 "violations": [v.to_dict() for v in violations],
             }
             if violations:

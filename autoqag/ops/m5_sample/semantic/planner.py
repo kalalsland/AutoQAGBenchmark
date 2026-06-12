@@ -25,6 +25,7 @@ from autoqag.ops.m5_sample.semantic import scoring, seed
 from autoqag.ops.m5_sample.semantic import virtual_edges as ve
 from autoqag.ops.m5_sample.semantic.memory import SemanticMemory
 from autoqag.schema import (
+    INFERENCE_FLOOR,
     NodeType,
     QuestionGoal,
     QuestionPlan,
@@ -47,6 +48,8 @@ class OverlayPlanner:
         use_score_guided: bool = True,
         use_binding: bool = True,
         use_overlay: bool = True,
+        use_core_edges: bool = True,
+        use_compat_gate: bool = True,
         use_dual_multihop: bool = True,
         use_sufficiency: bool = True,
     ):
@@ -60,6 +63,8 @@ class OverlayPlanner:
         self.use_score_guided = use_score_guided    # 评分引导扩展 Accept(v)
         self.use_binding = use_binding              # 题型专属语义绑定
         self.use_overlay = use_overlay              # 虚拟逻辑补全 Ωq
+        self.use_core_edges = use_core_edges        # 核心推断边 always 铺设 (§3.6.0)
+        self.use_compat_gate = use_compat_gate      # 条件兼容门 (§3.6 第2关)
         self.use_dual_multihop = use_dual_multihop  # 双重多跳 + 难度封顶
         self.use_sufficiency = use_sufficiency      # 逻辑充分性硬门槛
 
@@ -94,18 +99,19 @@ class OverlayPlanner:
                 if u:
                     candidates.add(u)
 
-        # 5. 虚拟逻辑补全 (针对缺失角色)
+        # 5. 核心推断边 always 铺设 + 缺失角色补全 (§3.6)
         overlay: List[VirtualEdge] = []
-        missing = scoring.missing_roles(qtype, role_assignment)
-        if self.use_overlay and missing:
-            overlay = self._virtual_completion(
-                qtype, goal.difficulty_level, role_assignment, missing, role_pool
-            )
-            # 接受的虚拟边把其 target 填入角色 + 把 backing path 节点纳入子图
+        if self.use_overlay:
+            overlay = self._build_overlay(qtype, role_assignment, role_pool, candidates)
+            if overlay is None:
+                # 核心比较/跨文献边条件冲突 → 整题作废 (杜绝伪可比题)
+                self.memory.record_pattern(self._overlay_pattern(qtype, role_assignment), success=False)
+                return None
+            # 接受的虚拟边把其 target 填入角色 + 把凭据路径节点纳入子图
             for e in overlay:
                 if e.status == "accepted" and e.question_role and not role_assignment.get(e.question_role):
                     role_assignment[e.question_role] = e.target
-                    candidates.update(e.required_physical_nodes)
+                candidates.update(e.required_physical_nodes)
 
         # 5b. 证据角色物理回落：仍空缺的 evidence 角色用锚点所属 ChunkNode 接地
         #     (chunk_id == ChunkNode.node_id，ChunkNode 即可追溯的物理证据 span)
@@ -118,16 +124,20 @@ class OverlayPlanner:
                 return None
 
         # 6. 评分引导地选定最终子图节点集 (Accept(v): 仅保留提升评分的节点)
+        theme_canonical = view.nodes.get(seed_node, {}).get("canonical_id", "")
         node_ids = self._select_subgraph(
-            qtype, goal.difficulty_level, seed_node, role_assignment, candidates, goal.theme
+            qtype, goal.difficulty_level, seed_node, role_assignment, candidates,
+            goal.theme, theme_canonical,
         )
 
-        # 难度由结构变量决定 (复用既有 planner)，再按真实跨 chunk 跨度封顶，
-        # 避免单 chunk 富节点子图被误判为 L3/L4 造成伪多跳 (§3.4.4 双重多跳)。
+        # 难度由结构变量决定 (复用既有 planner)，再由推断算子下限抬升 (§1.2)，
+        # 最后按真实跨 chunk 跨度封顶 (§3.7 双重多跳)：
+        #   难度 = cap_by_chunk( max(结构难度等级, 推断算子下限) )
         datas = view.datas(node_ids)
         path_len = max(0, len(node_ids) - 1)
         feats = difficulty_features(datas, path_len)
         difficulty = compute_difficulty(feats)
+        difficulty = _apply_inference_floor(difficulty, R.core_inference_op(qtype))
         if self.use_dual_multihop:
             difficulty = _cap_difficulty(view, node_ids, difficulty, path_len)
         goal.difficulty_level = difficulty
@@ -135,15 +145,16 @@ class OverlayPlanner:
         edges = self._subgraph_edges(node_ids)
         parts = scoring.utility_score(
             view, qtype, difficulty, node_ids, edges, role_assignment,
-            theme=goal.theme, path_length=path_len,
+            theme=goal.theme, path_length=path_len, theme_canonical=theme_canonical,
         )
 
         overlay_pattern = self._overlay_pattern(qtype, role_assignment)
 
-        # 7. 逻辑充分性 + 双重多跳验证 (消融时可分别关闭)
+        # 7. 逻辑充分性 + 双重多跳 + 核心边反捷径验证 (消融时可分别关闭)
         suff_ok = scoring.logical_sufficiency(parts, qtype) if self.use_sufficiency else True
         dual_ok = (
             scoring.dual_multihop_ok(view, node_ids, difficulty, path_len)
+            and self._core_edges_ok(overlay, difficulty)
             if self.use_dual_multihop else True
         )
         ok = suff_ok and dual_ok
@@ -156,8 +167,9 @@ class OverlayPlanner:
         self.memory.record_pattern(overlay_pattern, success=True)
         self.memory.record_seed(seed_node)
 
+        masking_spec = self._build_masking_spec(qtype, overlay, role_assignment)
         return self._finalize(qid, qtype, difficulty, goal, seed_node, role_assignment,
-                              node_ids, edges, overlay, parts, overlay_pattern)
+                              node_ids, edges, overlay, parts, overlay_pattern, masking_spec)
 
     # ----------------------------------------------------------------- #
     def _plan_logic(self, qtype: str, seed_node: str) -> QuestionGoal:
@@ -454,25 +466,86 @@ class OverlayPlanner:
         papers.discard("")
         return len(papers) >= 2
 
-    def _virtual_completion(
-        self, qtype, difficulty, role_assignment, missing, role_pool
-    ) -> List[VirtualEdge]:
-        """生成候选虚拟边 → 打分 → 证据回落验证，返回已验证的虚拟边 (按分降序)。"""
-        cands = ve.propose_virtual_edges(
-            self.view, qtype, role_assignment, missing, role_pool
-        )
+    def _build_overlay(
+        self, qtype, role_assignment, role_pool, candidates
+    ) -> Optional[List[VirtualEdge]]:
+        """铺设核心推断边 + 缺失角色补全边 → 验证(凭据/条件兼容) → 打分 → 保留 (§3.6)。
+
+        返回已验证的虚拟边 (按分降序)；若核心比较/跨文献边出现条件冲突，返回 None
+        表示整题作废 (杜绝伪可比题)。
+        """
+        view = self.view
+        edges: List[VirtualEdge] = []
+        if self.use_core_edges:
+            edges += ve.propose_core_edges(view, qtype, role_assignment, role_pool)
+        missing = scoring.missing_roles(qtype, role_assignment)
+        if missing:
+            edges += ve.propose_completion_edges(view, qtype, role_assignment, missing, role_pool)
+
         validated: List[VirtualEdge] = []
-        for e in cands:
-            ve.validate_backing(self.view, e)  # 找物理证据回落路径
-            e.score = ve.score_edge(self.view, e, qtype, difficulty)
-            # 只有能回落到物理证据且评分为正的虚拟边被保留 (§3.6 末)
+        for e in edges:
+            compat_nodes = (
+                self._compat_operands(qtype, role_assignment)
+                if (self.use_compat_gate and e.inference_op in ve._COMPAT_OPS) else None
+            )
+            # difficulty="" 时不触发核心边反捷径 (难度尚未定形)，仅做凭据+条件兼容门；
+            # 核心边反捷径在难度定形后由 _core_edges_ok 统一判定。
+            ve.validate_backing(view, e, difficulty="", compat_nodes=compat_nodes)
+            e.score = ve.score_edge(view, e, qtype, "")
+            if self.use_compat_gate and e.is_core and \
+                    e.compatibility.get("status") == "conflict":
+                return None  # 核心边条件冲突 → 整题作废
             if e.status == "accepted" and e.score > 0:
                 validated.append(e)
         validated.sort(key=lambda x: x.score, reverse=True)
         return validated
 
+    def _compat_operands(self, qtype: str, role_assignment: Dict[str, str]):
+        """条件兼容门要核验的两个承载条件的操作数 (条件挂在数值/实例上，非对象标签)。"""
+        if qtype == "comparative":
+            a = role_assignment.get("value_A") or role_assignment.get("object_A")
+            b = role_assignment.get("value_B") or role_assignment.get("object_B")
+        elif qtype == "cross_paper":
+            a = role_assignment.get("result_A") or role_assignment.get("paper_A_instance")
+            b = role_assignment.get("result_B") or role_assignment.get("paper_B_instance")
+        else:
+            return None
+        return (a, b) if a and b else None
+
+    def _core_edges_ok(self, overlay: List[VirtualEdge], difficulty: str) -> bool:
+        """核心推断边反捷径硬门槛：高难度 (L3/L4) 核心边凭据须跨 ≥2 chunk (§3.6)。"""
+        if difficulty not in ("L3", "L4"):
+            return True
+        for e in overlay:
+            if e.is_core and len(e.backing_chunks) < 2:
+                return False
+        return True
+
+    def _build_masking_spec(
+        self, qtype: str, overlay: List[VirtualEdge], role_assignment: Dict[str, str]
+    ) -> Dict[str, Any]:
+        """构造遮蔽测试规格 (§3.8/§4.1)：删某操作数凭据应使题不可答；限单 chunk 应使高难题不可答。"""
+        drop_operand: List[str] = []
+        drop_cross_chunk: List[str] = []
+        for e in overlay:
+            if not e.is_core:
+                continue
+            # 删掉 target 操作数的凭据节点 (除 source 锚点外的路径节点)
+            for n in e.required_physical_nodes:
+                if n != e.source and n not in drop_operand:
+                    drop_operand.append(n)
+            # 凭据跨 chunk 的桥接节点 (供"限单 chunk"遮蔽)
+            if len(e.backing_chunks) >= 2:
+                drop_cross_chunk.extend(e.backing_chunks[1:])
+        spec: Dict[str, Any] = {}
+        if drop_operand:
+            spec["drop_operand"] = drop_operand
+        if drop_cross_chunk:
+            spec["drop_cross_chunk"] = list(dict.fromkeys(drop_cross_chunk))
+        return spec
+
     def _select_subgraph(
-        self, qtype, difficulty, seed_node, role_assignment, candidates, theme
+        self, qtype, difficulty, seed_node, role_assignment, candidates, theme, theme_canonical=""
     ) -> List[str]:
         """评分引导的增量子图选择 (Accept(v): 只保留提升综合评分的节点；§3.4)。"""
         view = self.view
@@ -485,6 +558,7 @@ class OverlayPlanner:
             return scoring.utility_score(
                 view, qtype, difficulty, nodes, edges, role_assignment,
                 theme=theme, path_length=max(0, len(nodes) - 1),
+                theme_canonical=theme_canonical,
             )["total"]
 
         current = list(base)
@@ -524,7 +598,7 @@ class OverlayPlanner:
 
     def _finalize(
         self, qid, qtype, difficulty, goal, seed_node, role_assignment,
-        node_ids, edges, overlay, parts, overlay_pattern,
+        node_ids, edges, overlay, parts, overlay_pattern, masking_spec=None,
     ) -> QuestionPlan:
         view = self.view
         evidence_spans = [
@@ -597,6 +671,8 @@ class OverlayPlanner:
             utility_score=parts.get("total", 0.0),
             score_breakdown=parts,
             overlay_pattern=overlay_pattern,
+            inference_ops=sorted({e.inference_op for e in overlay if e.inference_op}),
+            masking_spec=masking_spec or {},
         )
 
 
@@ -608,6 +684,18 @@ _EV_ANCHOR = {
     "supporting_evidence": ["observed_result", "intermediate_mechanism", "method_or_intervention"],
     "evidence": ["value", "attribute", "concept", "equation", "figure_or_table", "claim"],
 }
+
+
+def _apply_inference_floor(difficulty: str, inference_op: str) -> str:
+    """推断算子下限抬升 (operational_flow.md §1.2)：难度取 max(结构难度, 算子下限)。
+
+    跨文献/条件转移/因果链等推理本身就难，即使结构上只跨少数 chunk 也不被低标。
+    """
+    order = ["L1", "L2", "L3", "L4"]
+    floor = INFERENCE_FLOOR.get(inference_op or "", "L1")
+    if order.index(floor) > order.index(difficulty):
+        return floor
+    return difficulty
 
 
 def _cap_difficulty(view, node_ids: List[str], difficulty: str, path_len: int) -> str:

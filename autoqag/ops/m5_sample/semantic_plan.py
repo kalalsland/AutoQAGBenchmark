@@ -73,6 +73,8 @@ class SemanticPlanStage(BaseStage):
             use_score_guided=bool(self.params.get("use_score_guided", True)),
             use_binding=bool(self.params.get("use_binding", True)),
             use_overlay=bool(self.params.get("use_overlay", True)),
+            use_core_edges=bool(self.params.get("use_core_edges", True)),
+            use_compat_gate=bool(self.params.get("use_compat_gate", True)),
             use_dual_multihop=bool(self.params.get("use_dual_multihop", True)),
             use_sufficiency=bool(self.params.get("use_sufficiency", True)),
         )

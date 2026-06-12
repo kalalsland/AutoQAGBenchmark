@@ -120,23 +120,31 @@ def constraint_coverage(view, node_ids: List[str]) -> float:
     return len(have & target) / len(target) if target else 1.0
 
 
-def semantic_score(view, node_ids: List[str], theme: str) -> float:
-    """高级节点聚合语义评分：与主题 token 重叠 (轻量近似，避免引入向量依赖)。"""
-    if not theme:
+def semantic_score(view, node_ids: List[str], theme: str, theme_canonical: str = "") -> float:
+    """高级节点聚合语义评分 (operational_flow.md §3.7.2)。
+
+    先比 canonical_id (与主题同 canonical_id 即命中——免费解决同义异形，如 PCE 与
+    efficiency 共享 canonical_id)，否则回退到 theme-token 重叠。零依赖、可复现、够快。
+    """
+    if not theme and not theme_canonical:
         return 0.5
     theme_tokens = {t for t in theme.lower().split() if len(t) > 1}
-    if not theme_tokens:
+    if not theme_tokens and not theme_canonical:
         return 0.5
     hit = 0
     total = 0
     for nid in node_ids:
-        c = (view.nodes.get(nid, {}).get("normalized_content")
-             or view.nodes.get(nid, {}).get("content") or "").lower()
+        d = view.nodes.get(nid, {})
+        # (1) canonical_id 命中 (优先)
+        cid = d.get("canonical_id", "")
+        c = (d.get("normalized_content") or d.get("content") or "").lower()
         toks = {t for t in c.split() if len(t) > 1}
-        if not toks:
+        if not toks and not cid:
             continue
         total += 1
-        if theme_tokens & toks:
+        if theme_canonical and cid and cid == theme_canonical:
+            hit += 1
+        elif theme_tokens & toks:
             hit += 1
     return hit / total if total else 0.5
 
@@ -224,10 +232,11 @@ def utility_score(
     role_assignment: Dict[str, str],
     theme: str = "",
     path_length: int = 0,
+    theme_canonical: str = "",
 ) -> Dict[str, float]:
     """综合子图评分，返回分项 + total (Subgraph Utility Score)。"""
     parts = {
-        "semantic": semantic_score(view, node_ids, theme),
+        "semantic": semantic_score(view, node_ids, theme, theme_canonical),
         "role": role_completeness(qtype, role_assignment),
         "evidence": evidence_sufficiency(view, qtype, role_assignment),
         "constraint": constraint_coverage(view, node_ids),

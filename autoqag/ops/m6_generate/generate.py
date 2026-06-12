@@ -97,6 +97,8 @@ class GenerateStage(BaseStage):
                 constraints=data.get("constraints", {}) or plan.constraints,
                 domain=plan.domain,
                 paper_id_list=plan.paper_id_list,
+                masking_spec=plan.masking_spec,
+                inference_ops=plan.inference_ops,
             )
             qa_items.append(item)
             if insufficient:

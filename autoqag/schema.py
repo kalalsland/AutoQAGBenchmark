@@ -96,6 +96,42 @@ class VirtualEdgeType(str, Enum):
     SEARCH_COMPARABLE = "virtual_search_comparable"
 
 
+class InferenceOp(str, Enum):
+    """推断算子 (operational_flow.md §3.6)：答题者在这道题上必须做的推理操作。
+
+    与 VirtualEdgeType (规划期"怎么搜")正交：InferenceOp 表达"答题者要做什么推理"，
+    它决定题目的推理难度下限 (INFERENCE_FLOOR) 与 backing 的路由方式。
+    一条被推断出的关系 (虚拟边) 携带一个 InferenceOp。
+    """
+
+    ALIAS_BRIDGE = "alias_bridge"            # 同指/共指消解
+    ATTRIBUTE_LOOKUP = "attribute_lookup"    # 取值 (单跳事实)
+    CONDITION_BIND = "condition_bind"        # 绑定适用条件边界
+    COMPARISON = "comparison"                # A/B 共享指标对比
+    CONDITION_SHIFT = "condition_shift"      # 同对象跨条件变化
+    CAUSAL_CHAIN = "causal_chain"            # 方法→机制→结果
+    AGGREGATION = "aggregation"              # 章节级聚合
+    CROSS_PAPER_ALIGN = "cross_paper_align"  # 跨文献对齐 + 比较
+    CONTRAST = "contrast"                    # 冲突/对比
+    VISUAL_GROUNDING = "visual_grounding"    # 正文结论 ↔ 图表
+
+
+# 每个推断算子的推理难度下限 (operational_flow.md §1.2)：
+# 难度 = cap_by_chunk( max(结构难度等级, INFERENCE_FLOOR[op]) )
+INFERENCE_FLOOR: Dict[str, str] = {
+    InferenceOp.ALIAS_BRIDGE.value: "L1",
+    InferenceOp.ATTRIBUTE_LOOKUP.value: "L1",
+    InferenceOp.CONDITION_BIND.value: "L2",
+    InferenceOp.COMPARISON.value: "L2",
+    InferenceOp.AGGREGATION.value: "L2",
+    InferenceOp.VISUAL_GROUNDING.value: "L2",
+    InferenceOp.CONDITION_SHIFT.value: "L3",
+    InferenceOp.CAUSAL_CHAIN.value: "L3",
+    InferenceOp.CROSS_PAPER_ALIGN.value: "L3",
+    InferenceOp.CONTRAST.value: "L3",
+}
+
+
 class Difficulty(str, Enum):
     L1 = "L1"
     L2 = "L2"
@@ -295,6 +331,13 @@ class VirtualEdge:
     backing_evidence_paths: List[List[str]] = field(default_factory=list)
     required_physical_nodes: List[str] = field(default_factory=list)
     status: str = "candidate"  # candidate / accepted / rejected
+    # --- 改造新增 (operational_flow.md §3.6) ---
+    inference_op: str = ""  # InferenceOp 值：这条边要求的推理操作
+    posited_relation: str = ""  # 人读的被推断关系，如 "device A > device B on PCE"
+    backing_chunks: List[str] = field(default_factory=list)  # 凭据路径触及的 chunk 集合
+    compatibility: Dict[str, Any] = field(default_factory=dict)  # 条件/单位兼容性核验结果
+    is_core: bool = False  # True=题型核心推断边；False=补全边
+    masking_spec: Dict[str, Any] = field(default_factory=dict)  # 遮蔽测试规格 (§3.8)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -379,6 +422,11 @@ class QuestionPlan:
     score_breakdown: Dict[str, float] = field(default_factory=dict)
     # 该 plan 由哪条规划路径产出 (用于长期记忆 overlay pattern)
     overlay_pattern: str = ""
+    # --- 改造新增 (operational_flow.md §3.6/§3.8) ---
+    # 本题核心推断算子 (InferenceOp 值列表)，驱动推理难度下限与遮蔽测试
+    inference_ops: List[str] = field(default_factory=list)
+    # 遮蔽测试规格：{drop_operand: [...], drop_cross_chunk: [...]} (§4.1 行为反伪多跳)
+    masking_spec: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -411,6 +459,9 @@ class QAItem:
     # 标记：是否为 corrupted 负样本及其错误类型
     is_corrupted: bool = False
     error_type: str = ""
+    # 遮蔽测试规格 (从 QuestionPlan 透传；§4.1 行为反伪多跳)
+    masking_spec: Dict[str, Any] = field(default_factory=dict)
+    inference_ops: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

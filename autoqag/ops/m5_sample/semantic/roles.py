@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from typing import Dict, List
 
-from autoqag.schema import NodeType, QuestionType
+from autoqag.schema import InferenceOp, NodeType, QuestionType
 
 # ---------------------------------------------------------------------------
 # 完整逻辑角色 (语义层子图构建.pdf §3.1.1)
@@ -215,3 +215,52 @@ def seed_types(qtype: str) -> List[str]:
 
 def is_evidence_role(role: str) -> bool:
     return "evidence" in role or role in ("supporting_evidence", "evidence_span")
+
+
+# ---------------------------------------------------------------------------
+# 题型核心推断算子 + 核心虚拟边模板 (operational_flow.md §3.6.0)
+# 每项: (核心 InferenceOp, [(source_role, target_role, VirtualEdgeType, question_role), ...])
+# 核心边在角色绑定完成后 always 铺设 (即使最小角色集已被物理扩展填满)，
+# 把虚拟边从"事后补缺的补丁"提升为"每道题的推理主干"。
+# 单跳事实题 (numerical/formula/atomic) 不强制核心边，仅缺角色时补全。
+# ---------------------------------------------------------------------------
+from autoqag.schema import VirtualEdgeType as _VET  # noqa: E402
+
+CORE_INFERENCE: Dict[str, Dict[str, object]] = {
+    QuestionType.COMPARATIVE.value: {
+        "op": InferenceOp.COMPARISON.value,
+        "edges": [("object_A", "object_B", _VET.COMPARABLE.value, "comparison_criterion")],
+    },
+    QuestionType.CONDITION.value: {
+        "op": InferenceOp.CONDITION_BIND.value,
+        "edges": [("claim", "condition_boundary", _VET.LIMITED_BY.value, "condition_boundary")],
+    },
+    "mechanism": {
+        "op": InferenceOp.CAUSAL_CHAIN.value,
+        "edges": [
+            ("method_or_intervention", "intermediate_mechanism", _VET.SEEK_MECHANISM.value, "intermediate_mechanism"),
+            ("intermediate_mechanism", "observed_result", _VET.METHOD_EFFECT.value, "observed_result"),
+        ],
+    },
+    "cross_paper": {
+        "op": InferenceOp.CROSS_PAPER_ALIGN.value,
+        "edges": [("paper_A_instance", "paper_B_instance", _VET.CROSS_PAPER_ALIGN.value, "cross_paper_relation")],
+    },
+    QuestionType.TABLE.value: {
+        "op": InferenceOp.VISUAL_GROUNDING.value,
+        "edges": [("text_claim", "figure_or_table", _VET.NEED_VISUAL_EVIDENCE.value, "figure_or_table")],
+    },
+    QuestionType.SUMMARY.value: {
+        "op": InferenceOp.AGGREGATION.value,
+        "edges": [],  # 聚合无单一二元核心边；算子下限仍生效
+    },
+}
+
+
+def core_inference(qtype: str) -> Dict[str, object]:
+    """返回题型的核心推断算子与核心虚拟边模板；无核心边的题型返回空模板。"""
+    return CORE_INFERENCE.get(qtype, {"op": "", "edges": []})
+
+
+def core_inference_op(qtype: str) -> str:
+    return str(core_inference(qtype).get("op", "") or "")
